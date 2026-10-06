@@ -1,0 +1,16 @@
+[project]
+name = "dapi-unet"
+version = "0.1.0"
+description = "U-Net for predicting DAPI nuclear staining from brightfield images"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.1", "numpy", "tifffile", "pillow"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools]
+packages = ["dapi_unet"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
