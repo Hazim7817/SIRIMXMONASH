@@ -86,6 +86,9 @@ class DapiLoss(nn.Module):
         self.data_range = data_range
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # F.l1_loss would silently broadcast mismatched shapes.
+        if pred.shape != target.shape:
+            raise ValueError(f"prediction shape {tuple(pred.shape)} != target shape {tuple(target.shape)}")
         l1 = F.l1_loss(pred.float(), target.float())
         if self.ssim_weight == 0:
             return l1
