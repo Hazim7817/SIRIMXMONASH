@@ -12,15 +12,16 @@ Example::
 Checks that the run is working:
 
 * Before training, every image pair is validated (matching sizes, consistent
-  channel counts, no NaN/Inf), so bad data fails immediately rather than
-  mid-run.
+  channel counts, no NaN/Inf, not nearly blank or saturated), so bad data
+  fails immediately rather than mid-run.
 * Every epoch prints the training loss and, when validation images exist,
   the validation loss, Pearson r and SSIM. With no validation images
   (one pair, or ``--val-fraction 0``) validation is skipped.
 * The same numbers are written to ``<out>/history.csv``.
 * Training stops with an error as soon as a loss becomes NaN or Inf.
 * The run ends with a summary that warns if the training loss never
-  decreased or the model never beat a constant-prediction baseline.
+  decreased, the model never beat the best constant prediction, or its
+  predictions are barely correlated with DAPI (e.g. mismatched pairs).
 """
 
 from __future__ import annotations
@@ -49,6 +50,9 @@ from dapi_unet import (
 )
 
 IMAGE_SUFFIXES = {".tif", ".tiff", ".npy", ".png"}
+# Below this best validation Pearson r the model has not learned to predict
+# nuclei; a constant output scores 0 and mismatched pairs score about 0.
+MIN_PEARSON_R = 0.3
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -108,11 +112,14 @@ def split_pairs(pairs: list, val_fraction: float, seed: int) -> tuple[list, list
     return pairs[n_val:], pairs[:n_val]
 
 
-def validate_images(images: list[tuple[np.ndarray, np.ndarray]], names: list[str]) -> list[str]:
-    """Check loaded (brightfield, DAPI) pairs before training starts.
+def validate_images(
+    images: list[tuple[np.ndarray, np.ndarray]], names: list[str], low: float = 1.0, high: float = 99.8
+) -> list[str]:
+    """Check normalized (brightfield, DAPI) pairs before training starts.
 
     Raises ValueError for problems that would crash or corrupt training and
-    returns warnings for images that are usable but suspicious.
+    returns warnings for images that are usable but suspicious. ``low`` and
+    ``high`` must be the percentiles the images were normalized with.
     """
     warnings = []
     for (src, tgt), name in zip(images, names):
@@ -125,6 +132,17 @@ def validate_images(images: list[tuple[np.ndarray, np.ndarray]], names: list[str
                 raise ValueError(f"{name}: {kind} image contains NaN or Inf values")
             if img.min() == img.max():
                 warnings.append(f"{name}: {kind} image is constant (blank or saturated)")
+                continue
+            # A normalized image spans ~1 between these percentiles. ~0 means
+            # they were equal and normalization divided by eps, inflating the
+            # few remaining pixels (e.g. a hot pixel on a blank field) to ~1e9.
+            lo, hi = np.percentile(img, [low, high])
+            if hi - lo < 0.5:
+                raise ValueError(
+                    f"{name}: {kind} image is nearly blank or saturated, so normalization inflates "
+                    f"its values to {np.abs(img).max():.3g}; remove it or widen "
+                    "--low-percentile/--high-percentile"
+                )
     for kind, index in (("brightfield", 0), ("DAPI", 1)):
         channels = {pair[index].shape[0] for pair in images}
         if len(channels) > 1:
@@ -181,16 +199,21 @@ def evaluate(model, images, loss_fn, device, amp) -> dict[str, float]:
 
 
 def constant_baseline_loss(train_images, val_images, loss_fn) -> float:
-    """Validation loss of predicting the mean training DAPI intensity everywhere.
+    """Lowest validation loss achievable by predicting one constant everywhere.
 
-    A model that is learning anything should end up well below this.
+    DAPI images are mostly background, so the mean intensity is a weak
+    constant; the median (optimal for L1) and other quantiles of the training
+    DAPI intensities are tried too. A model that learned to predict nuclei
+    from brightfield ends up well below this; one that only outputs the
+    background level does not.
     """
-    mean = float(np.mean([tgt.mean() for _, tgt in train_images]))
-    losses = []
-    for _, tgt in val_images:
-        tgt_t = torch.from_numpy(tgt)[None]
-        losses.append(loss_fn(torch.full_like(tgt_t, mean), tgt_t).item())
-    return float(np.mean(losses))
+    values = np.concatenate([tgt[:, ::4, ::4].ravel() for _, tgt in train_images])
+    candidates = [float(values.mean()), *np.quantile(values, [0.1, 0.25, 0.5, 0.75, 0.9]).tolist()]
+    targets = [torch.from_numpy(tgt)[None] for _, tgt in val_images]
+    return min(
+        float(np.mean([loss_fn(torch.full_like(t, value), t).item() for t in targets]))
+        for value in candidates
+    )
 
 
 def append_history(path: Path, row: dict) -> None:
@@ -209,25 +232,37 @@ def format_epoch(row: dict, epochs: int) -> str:
     )
 
 
-def summarize(history: list[dict], baseline: float | None) -> list[str]:
+def summarize(history: list[dict], baseline: float | None, best_epoch: int) -> list[str]:
     """End-of-run report, with warnings when the run does not look healthy."""
     first, last = history[0], history[-1]
-    lines = [f"train_loss {first['train_loss']:.4f} (epoch 1) -> {last['train_loss']:.4f} (epoch {last['epoch']})"]
+    lines = [
+        f"train_loss {first['train_loss']:.4f} (epoch 1) -> {last['train_loss']:.4f} (epoch {last['epoch']})"
+    ]
     if len(history) > 1 and last["train_loss"] >= first["train_loss"]:
-        lines.append(
-            "WARNING: training loss did not decrease; try another --lr and check that "
-            "brightfield and DAPI images are registered"
-        )
+        lines.append("WARNING: training loss did not decrease; try another --lr")
     if "val_loss" not in first:
         lines.append("validation was skipped (no validation images)")
+        lines.append(f"best.pt is from epoch {best_epoch} (lowest train_loss)")
         return lines
+
     best = min(history, key=lambda r: r["val_loss"])
     lines.append(
         f"best val_loss {best['val_loss']:.4f} at epoch {best['epoch']} "
-        f"(constant-prediction baseline {baseline:.4f})"
+        f"(best constant prediction {baseline:.4f})"
     )
     if best["val_loss"] >= baseline:
-        lines.append("WARNING: the model never beat the constant-prediction baseline on validation images")
+        lines.append("WARNING: the model never beat a constant prediction on the validation images")
+    best_r = max(r["val_pearson_r"] for r in history)
+    if best_r < MIN_PEARSON_R:
+        lines.append(
+            f"WARNING: predictions are barely correlated with DAPI (best val_pearson_r {best_r:.3f}); "
+            "check that brightfield and DAPI files are correctly paired and registered"
+        )
+    saved = next(r for r in history if r["epoch"] == best_epoch)
+    lines.append(
+        f"best.pt is from epoch {best_epoch} (highest val_pearson_r {saved['val_pearson_r']:.4f}, "
+        f"val_loss {saved['val_loss']:.4f})"
+    )
     return lines
 
 
@@ -245,14 +280,15 @@ def main(argv: list[str] | None = None) -> None:
 
     def load(pairs: list[tuple[Path, Path]]) -> list[tuple[np.ndarray, np.ndarray]]:
         return [
-            (normalize_percentile(load_image(s), **norm_kwargs), normalize_percentile(load_image(t), **norm_kwargs))
-            for s, t in pairs
+            tuple(normalize_percentile(load_image(path), **norm_kwargs) for path in pair) for pair in pairs
         ]
 
-    train_pairs, val_pairs = split_pairs(find_pairs(args.source_dir, args.target_dir), args.val_fraction, args.seed)
+    pairs = find_pairs(args.source_dir, args.target_dir)
+    train_pairs, val_pairs = split_pairs(pairs, args.val_fraction, args.seed)
     train_images, val_images = load(train_pairs), load(val_pairs)
+    names = [s.name for s, _ in train_pairs + val_pairs]
     try:
-        warnings = validate_images(train_images + val_images, [s.name for s, _ in train_pairs + val_pairs])
+        warnings = validate_images(train_images + val_images, names, **norm_kwargs)
     except ValueError as e:
         raise SystemExit(f"data check failed: {e}") from e
     for warning in warnings:
@@ -263,9 +299,11 @@ def main(argv: list[str] | None = None) -> None:
     baseline = None
     if val_images:
         baseline = constant_baseline_loss(train_images, val_images, loss_fn)
-        print(f"validation: constant-prediction baseline val_loss {baseline:.4f}")
+        print(f"validation: best constant prediction scores val_loss {baseline:.4f}; the model must beat it")
+    elif args.val_fraction == 0:
+        print("validation: skipped (disabled by --val-fraction 0)")
     else:
-        print("validation: skipped (no validation images; add image pairs or raise --val-fraction)")
+        print("validation: skipped (only one image pair; add more pairs to enable it)")
 
     sources, targets = zip(*train_images)
     dataset = PairedPatchDataset(
@@ -309,9 +347,8 @@ def main(argv: list[str] | None = None) -> None:
     for epoch in range(1, args.epochs + 1):
         start = time.perf_counter()
         lr = optimizer.param_groups[0]["lr"]
-        row = {"epoch": epoch, "train_loss": train_one_epoch(
-            model, loader, loss_fn, optimizer, scheduler, scaler, device, amp, epoch
-        )}
+        train_loss = train_one_epoch(model, loader, loss_fn, optimizer, scheduler, scaler, device, amp, epoch)
+        row = {"epoch": epoch, "train_loss": train_loss}
         if val_images:
             row.update(evaluate(model, val_images, loss_fn, device, amp))
         row.update(lr=lr, seconds=time.perf_counter() - start)
@@ -326,10 +363,8 @@ def main(argv: list[str] | None = None) -> None:
             save_checkpoint(args.out / "best.pt", model, normalization=norm_kwargs, epoch=epoch)
 
     print("summary:")
-    for line in summarize(history, baseline):
+    for line in summarize(history, baseline, best_epoch):
         print(f"  {line}")
-    criterion = "val_pearson_r" if val_images else "train_loss"
-    print(f"  best.pt is from epoch {best_epoch} (by {criterion})")
 
 
 if __name__ == "__main__":

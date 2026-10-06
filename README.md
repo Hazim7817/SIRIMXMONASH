@@ -63,10 +63,38 @@ data/dapi/well_A01.tif
 python train.py --source-dir data/brightfield --target-dir data/dapi --out runs/exp1
 ```
 
-Each epoch logs training loss, validation Pearson r and SSIM. The best
-checkpoint by validation Pearson r goes to `runs/exp1/best.pt`. Useful flags:
-`--attention`, `--norm group` (for very small batches), `--patch-size`,
-`--batch-size` and `--ssim-weight`. Mixed precision is on by default on CUDA.
+The best checkpoint by validation Pearson r goes to `runs/exp1/best.pt`.
+Useful flags: `--attention`, `--norm group` (for very small batches),
+`--patch-size`, `--batch-size` and `--ssim-weight`. Mixed precision is on by
+default on CUDA.
+
+### Checking that training works
+
+- **Before training**, every image pair is checked. A size mismatch,
+  NaN/Inf pixels, differing z-plane counts, or a nearly blank/saturated
+  image (one that percentile normalization would blow up) stops the run
+  with `data check failed: <file>: ...`.
+- **Every epoch** prints the training loss and, on the held-out images, the
+  validation loss, Pearson r and SSIM:
+
+  ```
+  epoch 6/6  train_loss 0.0814  val_loss 0.0479  val_pearson_r 0.9528  val_ssim 0.9224  lr 6.84e-05  4.6s
+  ```
+
+  The same columns go to `runs/exp1/history.csv` for plotting. Validation
+  is skipped when there are no validation images (a single image pair, or
+  `--val-fraction 0`), and the CSV then has only the training columns.
+  Training loss is measured on augmented patches in train mode, so it is
+  usually a little higher than validation loss.
+- **A NaN/Inf loss** stops training immediately.
+- **The end-of-run summary** warns when:
+  - the training loss never decreased (try another `--lr`);
+  - the model never beat the best constant prediction, i.e. it predicts
+    no better than a flat background image;
+  - the best validation Pearson r is below 0.3. This usually means the
+    brightfield and DAPI files are not paired or registered correctly. Note
+    that the training loss still falls in that case, so it can't be
+    trusted on its own.
 
 ## Predict
 
@@ -100,4 +128,6 @@ python -m pytest
 The tests cover output shapes for arbitrary sizes, every norm and attention
 variant, checkpoint round-trips, loss and metric identities, exact stitching
 for a pointwise model, paired augmentation consistency, and a small
-end-to-end learning check on synthetic nuclei.
+end-to-end learning check on synthetic nuclei. `tests/test_train.py` runs
+`train.py` end to end and covers each training check, including that
+mismatched brightfield/DAPI pairs trigger the low-correlation warning.
