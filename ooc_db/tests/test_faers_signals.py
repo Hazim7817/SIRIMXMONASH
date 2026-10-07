@@ -320,3 +320,26 @@ def test_scripts_refuse_an_outdated_schema(conn):
     conn.commit()
     with pytest.raises(SystemExit, match="older schema.sql"):
         db.check_schema(conn)
+
+
+def test_exact_and_drug_field_cannot_be_combined(capsys):
+    with pytest.raises(SystemExit):
+        fs.main(["--exact", "--drug-field", "generic_name"])
+    assert "not allowed with" in capsys.readouterr().err
+
+
+def test_no_reports_row_cites_the_current_release(run, conn, tmp_path):
+    run()
+    for k in [k for k in run.session.totals if k and "Troglitazone" in k]:
+        del run.session.totals[k]
+    run.session.last_updated = "2026-12-31"
+    run("--cache", str(tmp_path / "fresh.json"))
+    assert conn.execute(
+        """SELECT r.citation FROM reference_outcome r JOIN drug d USING (drug_id)
+           WHERE d.name = 'Troglitazone' AND r.source = 'FAERS'""").fetchone()[0].endswith("2026-12-31")
+
+
+def test_friendly_connection_errors():
+    from loaders import db
+    with pytest.raises(SystemExit, match="Could not connect"):
+        db.connect("postgresql://nobody:wrong@localhost:1/none")

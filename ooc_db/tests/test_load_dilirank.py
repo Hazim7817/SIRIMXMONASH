@@ -238,8 +238,12 @@ def test_duplicates_with_the_same_verdict_keep_the_most_serious_category():
                ld.Entry("drug a", "most", "vMost-DILI-Concern")]
     merged, warnings = ld.merge_duplicates(entries)
     assert [(e.name, e.category) for e in merged] == [("drug a", "most")] and warnings == []
-    # ...but they conflict when Less-DILI-concern is not counted as positive
+    # An ambiguous verdict (Less-DILI-concern here) does not contradict a clear one
     merged, warnings = ld.merge_duplicates(entries, "ambiguous")
+    assert merged[0].category == "most" and warnings == []
+    # ...but Most and No do conflict
+    merged, warnings = ld.merge_duplicates(
+        [ld.Entry("x", "most", "vMost"), ld.Entry("X", "no", "vNo")])
     assert merged[0].category == "ambiguous" and len(warnings) == 1
 
 
@@ -329,3 +333,18 @@ def test_mac_line_endings_utf16_and_semicolons_in_names(tmp_path):
     for path in (cr, utf16):
         assert [(e.name, e.category) for e in ld.parse(path)] == [
             ("A; B; C; D; E", "no"), ("acetaminophen", "most")], path.name
+
+
+def test_mac_roman_csv_is_decoded_and_odd_names_are_flagged(tmp_path, capsys):
+    path = tmp_path / "mac.csv"
+    path.write_bytes("Compound Name,vDILIConcern\rAminosalicylic acid\u00a0,vLess-DILI-concern\r"
+                     "Café drug,vNo-DILI-concern\r".encode("mac_roman"))
+    assert [e.name for e in ld.parse(path)] == ["Aminosalicylic acid", "Café drug"]
+    ld.main(["--file", str(path), "--dry-run"])
+    assert "non-English letters" in capsys.readouterr().err   # 'Café' is flagged for a look
+
+
+def test_encoding_option(tmp_path):
+    path = tmp_path / "dos.csv"
+    path.write_bytes("Compound Name,vDILIConcern\r\nCafé drug,vNo-DILI-concern\r\n".encode("cp850"))
+    assert [e.name for e in ld.parse(path, encoding="cp850")] == ["Café drug"]

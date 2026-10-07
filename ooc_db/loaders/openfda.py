@@ -107,7 +107,8 @@ class OpenFDA:
             os.replace(tmp, self.cache_path)
         except OSError as e:
             print(f"warning: could not save cache {self.cache_path} ({e})", file=sys.stderr)
-            tmp.unlink(missing_ok=True)
+        finally:
+            tmp.unlink(missing_ok=True)  # left over only if the swap did not happen (e.g. Ctrl+C)
 
     def _live_count(self, search: str | None) -> int:
         params = {"limit": 1}

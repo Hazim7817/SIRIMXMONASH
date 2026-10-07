@@ -217,7 +217,8 @@ def verdict(res: DrugResult, min_expected: float) -> str:
     return "ambiguous"
 
 
-def clear(conn, res: DrugResult, event_definition: str, today: dt.date) -> None:
+def clear(conn, res: DrugResult, event_definition: str, last_updated: str | None,
+          today: dt.date) -> None:
     """A drug that now returns no reports: drop its old statistics and mark
     its FAERS reference row ambiguous, keeping your use_for_scoring choice."""
     conn.execute("DELETE FROM faers_signal WHERE drug_id = %s AND event_definition = %s",
@@ -226,10 +227,14 @@ def clear(conn, res: DrugResult, event_definition: str, today: dt.date) -> None:
         endpoint, organ, source = EVENT_SCOPE[event_definition]
         conn.execute(
             """UPDATE reference_outcome SET verdict = 'ambiguous', retrieved_on = %s,
-                      finding = 'No FAERS reports found for: ' || %s
+                      finding = 'No FAERS reports found for: ' || %s, citation = %s
                WHERE drug_id = %s AND source = %s AND endpoint = %s AND organ = %s
                  AND species = 'human' AND method = 'statistical_signal'""",
-            (today, res.drug_query, res.drug_id, source, endpoint, organ))
+            (today, res.drug_query, citation(last_updated), res.drug_id, source, endpoint, organ))
+
+
+def citation(last_updated: str | None) -> str:
+    return f"openFDA drug adverse event API, data updated {last_updated or 'unknown'}"
 
 
 def save(conn, res: DrugResult, *, event_definition: str, terms: list[str], criterion: str,
@@ -276,7 +281,7 @@ def save(conn, res: DrugResult, *, event_definition: str, terms: list[str], crit
                     f"{t.a} of {t.a + t.b} reports mention {event_definition} terms "
                     f"({expected:.1f} expected); {ror_text}"),
         "verdict": res_verdict,
-        "citation": f"openFDA drug adverse event API, data updated {last_updated or 'unknown'}",
+        "citation": citation(last_updated),
         "use_for_scoring": False,
         "method": "statistical_signal",
         "source_record_id": None,
@@ -293,10 +298,11 @@ def main(argv: list[str] | None = None) -> None:
                    help="file of MedDRA preferred terms, one per line (default: dili_narrow.txt). "
                         "Only dili_narrow.txt and dili_extended.txt also write a reference_outcome "
                         "row; other files are stored in faers_signal only")
-    p.add_argument("--drug-field", action="append", dest="drug_fields", choices=sorted(DRUG_FIELDS),
+    fields = p.add_mutually_exclusive_group()
+    fields.add_argument("--drug-field", action="append", dest="drug_fields", choices=sorted(DRUG_FIELDS),
                    help="drug name field to search (repeatable; default: "
                         + ", ".join(WORD_FIELDS) + ")")
-    p.add_argument("--exact", action="store_true",
+    fields.add_argument("--exact", action="store_true",
                    help="match whole harmonised names only (" + ", ".join(EXACT_FIELDS) + "), for "
                         "drugs whose name is part of another's, e.g. estradiol / ethinyl estradiol")
     # argparse treats % in help text as a format character, hence the escaping.
@@ -350,7 +356,7 @@ def main(argv: list[str] | None = None) -> None:
                               drug_fields=drug_fields, event_search=event_search,
                               n_total=n_total, n_event=n_event, criterion=args.criterion)
                 if res.table is None:
-                    clear(conn, res, event_definition, today)
+                    clear(conn, res, event_definition, client.last_updated, today)
                     conn.commit()
                     print(f"[{i}/{len(drugs)}] {name}: {res.note}")
                     continue

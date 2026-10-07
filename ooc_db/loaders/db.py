@@ -8,7 +8,7 @@ import sys
 import psycopg
 
 DSN_ENV = "OOC_DATABASE_URL"
-SCHEMA_VERSION = "ooc_db schema version 3"   # must match COMMENT ON SCHEMA in schema.sql
+SCHEMA_VERSION = "ooc_db schema version 4"   # must match COMMENT ON SCHEMA in schema.sql
 
 
 def connect(dsn: str | None = None) -> psycopg.Connection:
@@ -22,11 +22,15 @@ def connect(dsn: str | None = None) -> psycopg.Connection:
         sys.exit(
             f"No database given. Pass --dsn or set {DSN_ENV}, e.g.\n"
             "  postgresql://postgres:YOUR_PASSWORD@localhost:5432/ooc\n"
-            "or, if the password contains @ : / # ? % or spaces,\n"
-            "  host=localhost port=5432 dbname=ooc user=postgres password='YOUR PASSWORD'\n"
-            "(inside the quotes, write \\' for a quote and \\\\ for a backslash)"
+            "If the password contains special characters, leave it out of the URL\n"
+            "(postgresql://postgres@localhost:5432/ooc) and set PGPASSWORD instead (see README)."
         )
-    conn = psycopg.connect(dsn)
+    try:
+        conn = psycopg.connect(dsn)
+    except psycopg.OperationalError as e:
+        sys.exit(f"Could not connect to the database: {str(e).strip()}\n"
+                 f"Check {DSN_ENV} (or --dsn), the password (PGPASSWORD), and that the database "
+                 "exists and PostgreSQL is running.")
     check_schema(conn)
     conn.execute("SET search_path TO ooc")
     return conn
@@ -85,7 +89,8 @@ def upsert_reference(conn: psycopg.Connection, row: dict) -> None:
 
     Imported rows are unique per drug, endpoint, organ, species and source.
     Re-running a loader refreshes the finding and verdict but keeps your
-    use_for_scoring choice.
+    use_for_scoring choice (unless the row was removed in between, e.g. by a
+    DILIrank load that did not include the drug).
     """
     if row["method"] not in ("database", "statistical_signal"):
         raise ValueError("upsert_reference is only for imported rows")

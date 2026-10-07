@@ -12,9 +12,10 @@ animal outcomes for the same drugs, and scores how often the chip agrees.
    measurements are invented and the drug facts must be verified. Re-run
    `schema.sql` to wipe them.
 
-Command-line equivalent:
+Command-line equivalent, run from the `ooc_db` folder:
 
 ```
+createdb -U postgres ooc
 psql -U postgres -d ooc -f schema.sql
 psql -U postgres -d ooc -f example_data.sql
 ```
@@ -34,13 +35,15 @@ scripts will say so. Back up the data, rebuild, and restore it:
 ```
 pg_dump -U postgres -d ooc --data-only --schema=ooc --exclude-table=ooc.faers_signal -f ooc_backup.sql
 psql -U postgres -d ooc -f schema.sql
-psql -U postgres -d ooc -f ooc_backup.sql
+psql -U postgres -d ooc -v ON_ERROR_STOP=1 --single-transaction -f ooc_backup.sql
 ```
 
-Then re-run the FAERS script, since its statistics are not kept. If the
-restore stops on a rule the new schema adds (for example an organ written
-`Liver` instead of `liver`), fix that row in `ooc_backup.sql` and run the
-last two commands again.
+The last command restores everything or nothing. If it prints an
+`ERROR`, nothing was restored: the message names the rule a row breaks
+(for example an organ written `Liver` instead of `liver`). Fix that row
+in `ooc_backup.sql` and run the last two commands again. Keep
+`ooc_backup.sql` until you have checked your data. Then re-run the FAERS
+script, since its statistics are not kept.
 
 ## Tables
 
@@ -59,18 +62,25 @@ last two commands again.
 Notes:
 
 - **Controls** are experiments with `is_control = true` and no drug.
-  Treated chips are compared with the average of the control chips that
-  share their `batch_label` (each control chip counts once, however many
-  replicates it has). Give controls with a different vehicle their own
-  batch label.
+  Treated chips are compared with the average of the control chips with
+  the same chip model, `batch_label`, readout and timepoint (each control
+  chip counts once, however many replicates it has). Give controls with a
+  different vehicle their own batch label.
 - **Verdicts** are `positive` (the effect happened: toxic, or effective),
   `negative`, or `ambiguous`. `endpoint` says whether you are asking about
   `toxicity` or `efficacy`.
 - **Organ and species** are written in lower case (`liver`, `human`,
   `rat`); the database rejects `Liver` so that spellings cannot split the
   results.
-- **Names** are unique regardless of capitals (`Aspirin` = `ASPIRIN`). A
-  drug name cannot also be another drug's alias.
+- **Names** are unique regardless of capitals (`Aspirin` = `ASPIRIN`),
+  and use single ordinary spaces. A drug name cannot also be another
+  drug's alias.
+- **Same drug under two names** (e.g. your `Abacavir` and the `Abacavir
+  sulfate` that the DILIrank loader added): merge them with
+  `SELECT ooc.merge_drugs('Abacavir', 'Abacavir sulfate');`. Everything
+  moves to the first name, and the second becomes its alias, so the
+  loaders find it next time. To avoid this, add DILIrank's spelling to
+  `drug_alias` before loading DILIrank.
 - **New organs or assays** need new `chip_model` and `readout` rows, not
   new columns.
 
@@ -120,12 +130,21 @@ macOS / Linux:
 export OOC_DATABASE_URL='postgresql://postgres:YOUR_PASSWORD@localhost:5432/ooc'
 ```
 
-If the password contains `@ : / # ? %` or spaces, use this form instead,
-with the password in single quotes (inside them, write `\'` for a quote
-and `\\` for a backslash):
-`host=localhost port=5432 dbname=ooc user=postgres password='YOUR PASSWORD'`.
-Wrap the whole value in double quotes when you set it in PowerShell. You
-can also pass either form with `--dsn` on each command.
+If the password contains anything other than letters and digits, leave it
+out of the URL and give it to PostgreSQL separately, in single quotes:
+
+```
+$env:OOC_DATABASE_URL = 'postgresql://postgres@localhost:5432/ooc'     # PowerShell
+$env:PGPASSWORD = 'YOUR PASSWORD'
+
+export OOC_DATABASE_URL='postgresql://postgres@localhost:5432/ooc'      # macOS / Linux
+export PGPASSWORD='YOUR PASSWORD'
+```
+
+Inside single quotes every character is taken literally. The only
+exception is a single quote in the password itself: write it as `''` in
+PowerShell, or as `'\''` in macOS/Linux. You can also pass the URL with
+`--dsn` on each command.
 
 ### DILIrank: curated human liver-injury classification
 
@@ -141,8 +160,11 @@ Or download it in a browser from the FDA page "Drug-Induced Liver Injury
 Rank (DILIrank 2.0) Dataset" and pass `--file "path\to\file.xlsx"`. The
 2.0 workbook has a `version 2` sheet (1,336 drugs, used by default) and a
 `version 1` sheet (the original 1,036; `--sheet "version 1"`). Older
-DILIrank 1.0 files and Excel CSV/TXT exports (including "Unicode Text"
-and Mac formats) also work.
+DILIrank 1.0 files and CSV/TXT exports also work. The encoding is detected
+for "CSV UTF-8", "Unicode Text", Windows and Mac CSV files. For any other
+encoding, pass it with `--encoding` (e.g. `--encoding cp850` for MS-DOS
+CSV). The loader warns about names with accented or unusual letters so you
+can check none are garbled. The `.xlsx` file avoids all of this.
 
 Every DILIrank drug is added to `drug` (use `--only-existing` to load only
 drugs you already have). Most-DILI-concern drugs become `positive`,
@@ -154,7 +176,8 @@ ambiguous` does.
 Each load replaces the previous DILIrank list. Rows are updated, not
 duplicated, and rows the loader wrote earlier for drugs missing from the
 file you load (for example after switching from `version 2` to
-`version 1`) are removed. If several DILIrank names turn out to be the
+`version 1`) are removed. If such a drug comes back in a later load, its
+row is recreated with `use_for_scoring = true`. If several DILIrank names turn out to be the
 same drug in your database, through `drug_alias`, they are merged: the
 most serious category is kept if their verdicts agree, and the drug is
 marked ambiguous if they do not. Rows you typed by hand with source
@@ -200,7 +223,8 @@ reports of ethinyl estradiol contraceptives, and "acetaminophen" counts
 combination products. The search used is saved in
 `faers_signal.drug_query`. For drugs whose name is part of another drug's
 name, re-run them with `--exact`, which matches whole harmonised names only
-("ESTRADIOL" but not "ETHINYL ESTRADIOL"). Add salt forms ("Estradiol
+("ESTRADIOL" but not "ETHINYL ESTRADIOL"); it cannot be combined with
+`--drug-field`. Add salt forms ("Estradiol
 valerate") as aliases, and note that `--exact` cannot find drugs openFDA
 has no harmonised name for. Salt words are never stripped down to a bare
 element, so "Lithium citrate" is searched under that name only; add
@@ -286,7 +310,8 @@ OOC_TEST_DSN='postgresql://postgres:pw@localhost/scratch' python -m pytest tests
 
 ## Typical workflow
 
-1. Add drugs, with PubChem CID and human Cmax.
+1. Add drugs, with PubChem CID and human Cmax. Add other spellings
+   (salt forms, brand names) to `drug_alias`.
 2. Enter reference outcomes for each drug: human, and animal if available.
 3. Run chips. Enter each experiment and its measurements, including controls.
 4. Check `v_measurement_vs_control` and decide each drug's `chip_call`.

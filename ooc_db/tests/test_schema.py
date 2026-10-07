@@ -121,8 +121,13 @@ def test_schema_works_without_search_path(conn):
     rejects(conn, "INSERT INTO ooc.drug (name) VALUES ('asa')")
 
 
-def test_interior_whitespace_rejected(conn):
-    for name in ("Valproic  acid", "Valproic\u00a0acid", "Valproic\tacid"):
+def test_any_unusual_whitespace_rejected(conn):
+    # every character Python treats as whitespace, except a single ordinary space
+    spaces = [chr(c) for c in range(0x110000) if chr(c).isspace() and c != 0x20]
+    for ch in spaces:
+        rejects(conn, "INSERT INTO drug (name) VALUES (%s)", (f"Valproic{ch}acid",))
+        rejects(conn, "INSERT INTO drug_alias (drug_id, alias) VALUES (1, %s)", (f"x{ch}",))
+    for name in ("Valproic  acid", " Valproic acid", "Valproic acid "):
         rejects(conn, "INSERT INTO drug (name) VALUES (%s)", (name,))
     conn.execute("INSERT INTO drug (name) VALUES ('Riboflavin 5''-phosphate')")
 
@@ -143,3 +148,27 @@ def test_example_data_loads(conn):
         "SELECT species, sensitivity_pct, specificity_pct FROM v_performance")}
     assert {k: tuple(map(float, v)) for k, v in perf.items()} == {
         "human": (100.0, 100.0), "rat": (100.0, 0.0)}
+
+
+def test_merge_drugs(conn):
+    conn.execute("INSERT INTO chip_model (name, organ) VALUES ('c', 'liver')")
+    conn.execute("INSERT INTO drug (name, human_cmax_um) VALUES ('Abacavir', 3)")
+    conn.execute("INSERT INTO drug (name, pubchem_cid, human_cmax_um) VALUES ('Abacavir sulfate', 441384, 9)")
+    _chip_call(conn, "Abacavir")
+    _ref(conn, "Abacavir sulfate", "positive", "DILIrank")
+    conn.execute("SELECT merge_drugs('abacavir', 'Abacavir sulfate')")
+    assert conn.execute("SELECT name, pubchem_cid, human_cmax_um FROM drug").fetchall() == [
+        ("Abacavir", 441384, 3)]  # kept drug's own values win; missing ones are filled
+    assert conn.execute("SELECT alias, source FROM drug_alias").fetchall() == [("Abacavir sulfate", "merged")]
+    assert conn.execute("SELECT drug, outcome FROM v_concordance").fetchall() == [("Abacavir", "true positive")]
+    rejects(conn, "SELECT merge_drugs('Abacavir', 'Nonexistent')")
+
+
+def test_merge_drugs_keeps_the_kept_drugs_imported_row(conn):
+    conn.execute("INSERT INTO drug (name) VALUES ('A'), ('A sodium')")
+    for drug_id, verdict in ((1, "negative"), (2, "positive")):
+        conn.execute("""INSERT INTO reference_outcome (drug_id, endpoint, organ, species, source, verdict, method)
+                        VALUES (%s, 'toxicity', 'liver', 'human', 'DILIrank', %s, 'database')""",
+                     (drug_id, verdict))
+    conn.execute("SELECT merge_drugs('A', 'A sodium')")
+    assert conn.execute("SELECT drug_id, verdict FROM reference_outcome").fetchall() == [(1, "negative")]

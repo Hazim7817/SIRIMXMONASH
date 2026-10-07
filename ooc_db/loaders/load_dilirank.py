@@ -95,20 +95,27 @@ def resolve_sheet(path: pathlib.Path, sheet: str | None = None) -> str | None:
         return sheet
 
 
-def _read_text_table(path: pathlib.Path) -> pd.DataFrame:
-    """CSV/TXT/TSV as saved by Excel: UTF-8, UTF-16 ('Unicode Text') or
-    Windows encoding; comma, semicolon or tab separated; any line endings;
-    title rows narrower than the table."""
-    data = path.read_bytes()
+def _decode(data: bytes, encoding: str | None) -> str:
+    """Text of a CSV/TXT file. Without --encoding: UTF-16 if it has a byte
+    order mark ('Unicode Text'), else UTF-8, else Mac Roman for files with
+    Mac (CR-only) line endings, else Windows (cp1252)."""
+    if encoding:
+        return data.decode(encoding)
     if data.startswith((b"\xff\xfe", b"\xfe\xff")):
-        text = data.decode("utf-16")
-    else:
-        for encoding in ("utf-8-sig", "cp1252", "latin-1"):
-            try:
-                text = data.decode(encoding)
-                break
-            except UnicodeDecodeError:
-                continue
+        return data.decode("utf-16")
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        pass
+    if b"\r" in data and b"\n" not in data:
+        return data.decode("mac_roman")
+    return data.decode("cp1252", errors="replace")
+
+
+def _read_text_table(path: pathlib.Path, encoding: str | None = None) -> pd.DataFrame:
+    """CSV/TXT/TSV as saved by Excel: comma, semicolon or tab separated; any
+    line endings; title rows narrower than the table."""
+    text = _decode(path.read_bytes(), encoding)
 
     def rows_for(delimiter: str) -> list[list[str]]:
         return list(csv.reader(io.StringIO(text, newline=""), delimiter=delimiter))
@@ -128,21 +135,21 @@ def _read_text_table(path: pathlib.Path) -> pd.DataFrame:
     return pd.DataFrame([r + [""] * (width - len(r)) for r in rows], dtype=str)
 
 
-def _read_table(path: pathlib.Path, sheet: str | None) -> pd.DataFrame:
+def _read_table(path: pathlib.Path, sheet: str | None, encoding: str | None = None) -> pd.DataFrame:
     if _is_text(path):
-        return _read_text_table(path)
+        return _read_text_table(path, encoding)
     return pd.read_excel(path, sheet_name=resolve_sheet(path, sheet), header=None, dtype=str,
                          keep_default_na=False)
 
 
-def parse(path: pathlib.Path, sheet: str | None = None) -> list[Entry]:
+def parse(path: pathlib.Path, sheet: str | None = None, encoding: str | None = None) -> list[Entry]:
     """Read DILIrank entries, finding the header row and columns by name.
 
     Handles the DILIrank 1.0 and 2.0 spellings ('Compound Name' or
     'CompoundName', 'vDILIConcern' or 'vDILI-Concern', with or without the
     'v' prefix on categories, any capitalisation).
     """
-    raw = _read_table(path, sheet)
+    raw = _read_table(path, sheet, encoding)
 
     header_row = None
     for i in range(min(len(raw), 20)):
@@ -203,9 +210,11 @@ def merge_group(group: list[Entry], less_concern_as: str) -> tuple[Entry, str | 
     verdicts agree, otherwise an ambiguous entry and a warning."""
     if len(group) == 1:
         return group[0], None
-    verdicts = {verdict_for(e.category, less_concern_as) for e in group}
+    # An ambiguous entry does not contradict a clear one.
+    definite = [e for e in group if verdict_for(e.category, less_concern_as) != "ambiguous"] or group
+    verdicts = {verdict_for(e.category, less_concern_as) for e in definite}
     if len(verdicts) == 1:
-        return min(group, key=lambda e: CATEGORIES.index(e.category)), None
+        return min(definite, key=lambda e: CATEGORIES.index(e.category)), None
     first = group[0]
     listed = "; ".join(f"'{e.name}' {e.raw_category}" for e in group)
     merged = Entry(first.name, "ambiguous", " / ".join(e.raw_category for e in group),
@@ -345,6 +354,8 @@ def main(argv: list[str] | None = None) -> None:
     src.add_argument("--download", action="store_true",
                      help=f"download DILIrank 2.0 from the FDA ({DOWNLOAD_URL}) and keep a copy")
     p.add_argument("--sheet", help=f"worksheet to read (default: '{PREFERRED_SHEET}' if present)")
+    p.add_argument("--encoding", help="text encoding of a CSV/TXT file, e.g. utf-8, cp1252, mac_roman "
+                                      "(default: detected)")
     p.add_argument("--dsn", help=f"database URL (default: ${db.DSN_ENV})")
     p.add_argument("--less-concern-as", choices=("positive", "ambiguous", "negative"), default="positive",
                    help="verdict for Less-DILI-concern drugs (default: positive)")
@@ -355,7 +366,11 @@ def main(argv: list[str] | None = None) -> None:
 
     path = download() if args.download else args.file
     sheet = resolve_sheet(path, args.sheet)
-    entries, warnings = merge_duplicates(parse(path, sheet), args.less_concern_as)
+    entries, warnings = merge_duplicates(parse(path, sheet, args.encoding), args.less_concern_as)
+    odd = [e.name for e in entries if not e.name.isascii()]
+    if odd:
+        print(f"warning: {len(odd)} names contain non-English letters, e.g. {odd[:3]}. If they look "
+              "garbled, re-save the file as .xlsx or 'CSV UTF-8', or pass --encoding.", file=sys.stderr)
     for w in warnings:
         print("warning:", w, file=sys.stderr)
     counts = Counter(e.category for e in entries)

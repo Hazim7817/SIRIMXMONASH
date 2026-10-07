@@ -10,7 +10,7 @@
 DROP SCHEMA IF EXISTS ooc CASCADE;
 CREATE SCHEMA ooc;
 -- The loaders check this version; change it with any incompatible change.
-COMMENT ON SCHEMA ooc IS 'ooc_db schema version 3';
+COMMENT ON SCHEMA ooc IS 'ooc_db schema version 4';
 SET search_path TO ooc;
 
 
@@ -19,11 +19,10 @@ SET search_path TO ooc;
 -- ---------------------------------------------------------------------------
 CREATE TABLE drug (
     drug_id        serial PRIMARY KEY,
-    -- Single spaces only: no leading/trailing or doubled spaces, tabs, line
-    -- breaks or non-breaking spaces, which would make 'Aspirin ' a
-    -- different drug from 'Aspirin'.
-    name           text NOT NULL CHECK (name = btrim(name) AND name !~ '[\t\r\n\u00a0]|  '
-                                        AND name <> ''),
+    -- Single ordinary spaces only: no leading/trailing or doubled spaces,
+    -- tabs, line breaks, non-breaking or other Unicode spaces, which would
+    -- make 'Aspirin ' a different drug from 'Aspirin'.
+    name           text NOT NULL CHECK (name !~ '[\t\n\v\f\r\x1c-\x1f\u0085   -     　]|^ | $|  ' AND name <> ''),
     pubchem_cid    integer UNIQUE,          -- use IDs, not names, to match external databases
     inchikey       text UNIQUE,
     human_cmax_um  numeric CHECK (human_cmax_um > 0),  -- peak blood concentration in patients, µM
@@ -38,8 +37,7 @@ CREATE UNIQUE INDEX drug_name_ci ON drug (lower(name));
 CREATE TABLE drug_alias (
     alias_id  serial PRIMARY KEY,
     drug_id   integer NOT NULL REFERENCES drug ON DELETE CASCADE,
-    alias     text NOT NULL CHECK (alias = btrim(alias) AND alias !~ '[\t\r\n\u00a0]|  '
-                                   AND alias <> ''),
+    alias     text NOT NULL CHECK (alias !~ '[\t\n\v\f\r\x1c-\x1f\u0085   -     　]|^ | $|  ' AND alias <> ''),
     source    text                          -- where the alias came from
 );
 CREATE UNIQUE INDEX drug_alias_ci ON drug_alias (lower(alias));
@@ -62,6 +60,54 @@ CREATE TRIGGER drug_alias_no_clash BEFORE INSERT OR UPDATE ON drug_alias
     FOR EACH ROW EXECUTE FUNCTION check_name_alias_clash();
 CREATE TRIGGER drug_name_no_clash BEFORE INSERT OR UPDATE OF name ON drug
     FOR EACH ROW EXECUTE FUNCTION check_name_alias_clash();
+
+-- Merge two rows that are the same drug, e.g. your 'Abacavir' and the
+-- 'Abacavir sulfate' the DILIrank loader added:
+--     SELECT ooc.merge_drugs('Abacavir', 'Abacavir sulfate');
+-- Everything linked to the duplicate moves to the drug you keep, the
+-- duplicate's name becomes an alias (so loaders find it next time), and
+-- details the kept drug lacks (PubChem CID, Cmax, ...) are copied over.
+-- Where both have an imported row for the same source, the kept drug's
+-- row stays. FAERS statistics of the duplicate are dropped; re-run the
+-- FAERS script.
+CREATE FUNCTION merge_drugs(keep_name text, duplicate_name text) RETURNS void
+LANGUAGE plpgsql SET search_path = ooc, pg_catalog AS $$
+DECLARE
+    keep ooc.drug;
+    dup  ooc.drug;
+BEGIN
+    SELECT * INTO keep FROM ooc.drug WHERE lower(name) = lower(keep_name);
+    SELECT * INTO dup FROM ooc.drug WHERE lower(name) = lower(duplicate_name);
+    IF keep.drug_id IS NULL THEN RAISE EXCEPTION 'no drug named "%"', keep_name; END IF;
+    IF dup.drug_id IS NULL THEN RAISE EXCEPTION 'no drug named "%"', duplicate_name; END IF;
+    IF keep.drug_id = dup.drug_id THEN RAISE EXCEPTION 'both names are the same drug'; END IF;
+    IF EXISTS (SELECT 1 FROM ooc.chip_call a JOIN ooc.chip_call b USING (chip_model_id, endpoint)
+               WHERE a.drug_id = keep.drug_id AND b.drug_id = dup.drug_id) THEN
+        RAISE EXCEPTION 'both drugs have a chip_call for the same chip model and endpoint; delete one first';
+    END IF;
+
+    DELETE FROM ooc.reference_outcome r
+    WHERE r.drug_id = dup.drug_id AND r.method IN ('database', 'statistical_signal')
+      AND EXISTS (SELECT 1 FROM ooc.reference_outcome k
+                  WHERE k.drug_id = keep.drug_id AND k.method IN ('database', 'statistical_signal')
+                    AND (k.endpoint, k.organ, k.species, k.source) = (r.endpoint, r.organ, r.species, r.source));
+    UPDATE ooc.reference_outcome SET drug_id = keep.drug_id WHERE drug_id = dup.drug_id;
+    UPDATE ooc.experiment SET drug_id = keep.drug_id WHERE drug_id = dup.drug_id;
+    UPDATE ooc.chip_call SET drug_id = keep.drug_id WHERE drug_id = dup.drug_id;
+    DELETE FROM ooc.drug_alias WHERE drug_id = dup.drug_id AND lower(alias) = lower(keep.name);
+    UPDATE ooc.drug_alias SET drug_id = keep.drug_id WHERE drug_id = dup.drug_id;
+    DELETE FROM ooc.faers_signal WHERE drug_id = dup.drug_id;
+    DELETE FROM ooc.drug WHERE drug_id = dup.drug_id;
+
+    UPDATE ooc.drug SET pubchem_cid   = coalesce(pubchem_cid, dup.pubchem_cid),
+                        inchikey      = coalesce(inchikey, dup.inchikey),
+                        human_cmax_um = coalesce(human_cmax_um, dup.human_cmax_um),
+                        cmax_source   = coalesce(cmax_source, dup.cmax_source),
+                        notes         = coalesce(notes, dup.notes)
+    WHERE drug_id = keep.drug_id;
+    INSERT INTO ooc.drug_alias (drug_id, alias, source) VALUES (keep.drug_id, dup.name, 'merged')
+    ON CONFLICT DO NOTHING;
+END $$;
 
 
 -- ---------------------------------------------------------------------------

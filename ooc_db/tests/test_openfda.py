@@ -149,3 +149,18 @@ def test_failed_cache_save_is_only_a_warning(tmp_path, capsys):
     blocked = tmp_path / "no_such_dir" / "c.json"
     assert client(FakeSession({None: 3}), cache_path=blocked).count(None) == 3
     assert "could not save cache" in capsys.readouterr().err
+
+
+def test_interrupted_save_leaves_no_temporary_file(tmp_path, monkeypatch):
+    import pathlib as pl
+    c = client(FakeSession({None: 1, "x": 2}), cache_path=tmp_path / "c.json")
+    c.count(None)
+    real_write = pl.Path.write_text
+
+    def interrupted(self, *a, **kw):
+        real_write(self, "partial")
+        raise KeyboardInterrupt
+    monkeypatch.setattr(pl.Path, "write_text", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        c.count("x")
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["c.json"]
