@@ -36,15 +36,33 @@ from loaders.openfda import OpenFDA, OpenFDAError, any_of
 
 HERE = pathlib.Path(__file__).resolve().parent
 DEFAULT_TERMS = HERE / "event_terms" / "dili_narrow.txt"
+# .exact matches the whole preferred term; the plain field would also match
+# longer terms ('HEPATITIS' inside 'HEPATITIS B').
 EVENT_FIELD = "patient.reaction.reactionmeddrapt.exact"
+# Drug name fields, searched as phrases (case-insensitive, word-based, so
+# 'troglitazone' also matches 'REZULIN (TROGLITAZONE)' and combination
+# products). No one field is complete: openFDA's harmonised names are missing
+# for many withdrawn drugs, and the reported product name is free text.
 DRUG_FIELDS = {
-    # openFDA-harmonised generic name. A phrase search also matches
-    # combination products that contain the drug.
     "generic_name": "patient.drug.openfda.generic_name",
-    # Active ingredient as harmonised by openFDA (e.g. salt forms).
-    "substance_name": "patient.drug.openfda.substance_name",
+    "medicinalproduct": "patient.drug.medicinalproduct",
+    "activesubstance": "patient.drug.activesubstance.activesubstancename",
 }
-EVENT_SCOPE = {"dili_narrow": ("toxicity", "liver")}
+# Which reference_outcome row each event definition (term file name) feeds.
+EVENT_SCOPE = {
+    "dili_narrow": ("toxicity", "liver", "FAERS"),
+    "dili_extended": ("toxicity", "liver", "FAERS (extended terms)"),
+}
+# Salt and hydrate words dropped to get the base drug name, so 'Abacavir
+# sulfate' is also searched as 'abacavir'.
+SALT_WORDS = {
+    "acetate", "anhydrous", "besilate", "besylate", "bitartrate", "bromide", "calcium",
+    "chloride", "citrate", "dihydrate", "dipropionate", "disodium", "fumarate", "gluconate",
+    "hcl", "hemihydrate", "hyclate", "hydrobromide", "hydrochloride", "lactate", "magnesium",
+    "maleate", "mesilate", "mesylate", "monohydrate", "napsylate", "nitrate", "pamoate",
+    "phosphate", "potassium", "sodium", "succinate", "sulfate", "sulphate", "tartrate",
+    "tosylate", "trihydrate",
+}
 
 
 def read_terms(path: pathlib.Path) -> list[str]:
@@ -89,15 +107,36 @@ def select_drugs(conn, names: list[str] | None, source: str | None) -> list[tupl
     return conn.execute("SELECT drug_id, name FROM drug ORDER BY name").fetchall()
 
 
+def base_name(name: str) -> str | None:
+    """Name without trailing salt/hydrate words, or None if nothing to strip.
+
+    Never reduces a name to a bare salt ('Potassium chloride' stays as is),
+    which would match thousands of unrelated products.
+    """
+    words = name.split()
+    while len(words) > 1 and words[-1].lower().strip(",") in SALT_WORDS:
+        words.pop()
+    if len(words) == len(name.split()) or words[-1].lower() in SALT_WORDS:
+        return None
+    return " ".join(words)
+
+
 def names_for(conn, drug_id: int, name: str) -> list[str]:
+    """The drug's name, its aliases, and their base names, without repeats."""
     aliases = [r[0] for r in conn.execute(
         "SELECT alias FROM drug_alias WHERE drug_id = %s ORDER BY alias", (drug_id,))]
     seen, out = set(), []
     for n in [name, *aliases]:
-        if n.lower() not in seen:
-            seen.add(n.lower())
-            out.append(n)
+        for candidate in (n, base_name(n)):
+            if candidate and candidate.lower() not in seen:
+                seen.add(candidate.lower())
+                out.append(candidate)
     return out
+
+
+def drug_clause(fields: list[str], names: list[str]) -> str:
+    """Reports where any of the name fields matches any of the names."""
+    return "(" + " OR ".join(any_of(DRUG_FIELDS[f], names) for f in fields) + ")"
 
 
 def check_terms(client: OpenFDA, terms: list[str]) -> list[str]:
@@ -106,10 +145,10 @@ def check_terms(client: OpenFDA, terms: list[str]) -> list[str]:
 
 
 def analyse(client: OpenFDA, drug_id: int, name: str, query_names: list[str], *,
-            drug_field: str, event_search: str, n_total: int, n_event: int,
+            drug_fields: list[str], event_search: str, n_total: int, n_event: int,
             criterion: str) -> DrugResult:
     res = DrugResult(drug_id, name, query_names)
-    drug_search = any_of(drug_field, query_names)
+    drug_search = drug_clause(drug_fields, query_names)
     n_drug = client.count(drug_search)
     if n_drug == 0:
         res.note = "no FAERS reports found under this name"
@@ -154,7 +193,7 @@ def save(conn, res: DrugResult, *, event_definition: str, terms: list[str], crit
     )
     if event_definition not in EVENT_SCOPE:
         return  # unknown organ/endpoint: keep the statistics only
-    endpoint, organ = EVENT_SCOPE[event_definition]
+    endpoint, organ, source = EVENT_SCOPE[event_definition]
     ror_text = (f"ROR {s.ror:.2f} (95% CI {s.ror_lower95:.2f}-{s.ror_upper95:.2f})"
                 if s.ror is not None else "ROR not estimable")
     db.upsert_reference(conn, {
@@ -163,7 +202,7 @@ def save(conn, res: DrugResult, *, event_definition: str, terms: list[str], crit
         "organ": organ,
         "species": "human",
         "evidence_type": "spontaneous adverse event reports",
-        "source": "FAERS",
+        "source": source,
         "finding": (f"{'Signal' if res.signal else 'No signal'} ({CRITERIA[criterion]}); "
                     f"{t.a} of {t.a + t.b} reports mention {event_definition} terms; {ror_text}"),
         "verdict": verdict(res, min_drug_reports),
@@ -182,7 +221,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--source", help="only drugs with a reference_outcome row from this source, e.g. DILIrank")
     p.add_argument("--terms", type=pathlib.Path, default=DEFAULT_TERMS,
                    help="file of MedDRA preferred terms, one per line (default: DILI narrow)")
-    p.add_argument("--drug-field", choices=sorted(DRUG_FIELDS), default="generic_name")
+    p.add_argument("--drug-field", action="append", dest="drug_fields", choices=sorted(DRUG_FIELDS),
+                   help="drug name field to search (repeatable; default: all three)")
     p.add_argument("--criterion", choices=sorted(CRITERIA), default="ror",
                    help="signal rule: " + "; ".join(f"{k} = {v}" for k, v in CRITERIA.items()))
     p.add_argument("--min-drug-reports", type=int, default=100,
@@ -194,7 +234,7 @@ def main(argv: list[str] | None = None) -> None:
 
     terms = read_terms(args.terms)
     event_definition = args.terms.stem
-    drug_field = DRUG_FIELDS[args.drug_field]
+    drug_fields = args.drug_fields or list(DRUG_FIELDS)
     client = OpenFDA(api_key=args.api_key, cache_path=args.cache)
     today = dt.date.today()
 
@@ -222,7 +262,7 @@ def main(argv: list[str] | None = None) -> None:
             signals = 0
             for i, (drug_id, name) in enumerate(drugs, 1):
                 res = analyse(client, drug_id, name, names_for(conn, drug_id, name),
-                              drug_field=drug_field, event_search=event_search,
+                              drug_fields=drug_fields, event_search=event_search,
                               n_total=n_total, n_event=n_event, criterion=args.criterion)
                 if res.table is None:
                     print(f"[{i}/{len(drugs)}] {name}: {res.note}")

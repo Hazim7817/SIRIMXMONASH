@@ -81,21 +81,26 @@ export OOC_DATABASE_URL=postgresql://postgres:YOUR_PASSWORD@localhost:5432/ooc
 
 ### DILIrank: curated human liver-injury classification
 
-1. Download the DILIrank spreadsheet from the FDA Liver Toxicity Knowledge
-   Base (search "DILIrank dataset fda.gov"). DILIrank 1.0 (1,036 drugs) and
-   DILIrank 2.0 (1,336 drugs) are both supported.
-2. Check it parses, then load it:
+DILIrank (FDA Liver Toxicity Knowledge Base) ranks drugs by their risk of
+liver injury in humans, from FDA drug labels and the literature.
 
 ```
-python -m loaders.load_dilirank --file DILIrank.xlsx --dry-run
-python -m loaders.load_dilirank --file DILIrank.xlsx
+python -m loaders.load_dilirank --download --dry-run   # fetch from fda.gov and check it parses
+python -m loaders.load_dilirank --download
 ```
+
+Or download it in a browser from the FDA page "Drug-Induced Liver Injury
+Rank (DILIrank 2.0) Dataset" and pass `--file "path/to/file.xlsx"`. The
+2.0 workbook has a `version 2` sheet (1,336 drugs, used by default) and a
+`version 1` sheet (the original 1,036; `--sheet "version 1"`). Older
+DILIrank 1.0 files and CSV exports also work.
 
 Every DILIrank drug is added to `drug` (use `--only-existing` to load only
 drugs you already have). Most-DILI-concern drugs become `positive`,
 No-DILI-concern `negative` and Ambiguous `ambiguous`. Less-DILI-concern is
-`positive` by default, as in most published liver-chip and in-vitro
-studies; `--less-concern-as ambiguous` leaves them out of scoring instead.
+`positive` by default (DILI-positive = Most + Less); benchmark studies
+often leave Less-DILI-concern out instead, which `--less-concern-as
+ambiguous` does.
 
 ### FAERS: signals from adverse event reports
 
@@ -106,26 +111,59 @@ python -m loaders.faers_signals --source DILIrank      # every DILIrank drug
 ```
 
 For each drug the script asks openFDA how many reports mention the drug, a
-set of liver-injury terms (`loaders/event_terms/dili_narrow.txt`), both,
-and neither, and computes the PRR and ROR. With the default rule (`--criterion
-ror`), a drug has a signal when the lower 95% confidence bound of the ROR is
-above 1 and at least 3 reports mention both. `--criterion evans` uses
-PRR >= 2, chi-squared >= 4 and at least 3 reports instead.
+set of liver-injury terms, both, and neither, and computes the PRR and ROR.
+With the default rule (`--criterion ror`), a drug has a signal when the
+lower 95% confidence bound of the ROR is above 1 and at least 3 reports
+mention both. `--criterion evans` uses PRR >= 2, chi-squared >= 4 and at
+least 3 reports instead.
+
+**How drugs are found.** The drug's name, its `drug_alias` names, and
+their base names without salt words ("Abacavir sulfate" is also searched as
+"abacavir") are searched in three fields: openFDA's harmonised generic
+name, the product name as reported, and the reported active ingredient.
+No single field is complete. In particular, openFDA has no harmonised name
+for many withdrawn drugs, which are common in DILIrank. Add brand names
+and other spellings to `drug_alias` if a drug is missed.
+
+**Which events count.** `loaders/event_terms/dili_narrow.txt` lists the
+MedDRA preferred terms for liver injury itself (e.g. Drug-induced liver
+injury, Hepatotoxicity, Hepatic failure, Hepatitis toxic). Lab results
+(ALT increased), viral hepatitis and chronic liver disease are left out.
+`dili_extended.txt` adds debated terms (jaundice, cholestasis, hepatic
+encephalopathy, liver transplant, ...). Re-run with
+`--terms loaders/event_terms/dili_extended.txt` to see whether your
+conclusions depend on the term choice. The extended results are stored
+separately (source `FAERS (extended terms)`). The script warns about any
+term that matches no reports.
 
 Results go to `faers_signal`. A summary row also goes to `reference_outcome`
-as source `FAERS`, but with `use_for_scoring = false`, because reporting
-signals are weaker evidence than DILIrank. Check how far they agree:
+with `use_for_scoring = false`, because reporting signals are weaker
+evidence than DILIrank. Check how far they agree:
 
 ```sql
-SELECT agreement, count(*) FROM ooc.v_faers_vs_dilirank GROUP BY agreement;
+SELECT event_definition, agreement, count(*)
+FROM ooc.v_faers_vs_dilirank GROUP BY 1, 2 ORDER BY 1, 2;
 ```
 
-Treat FAERS signals as supporting evidence only. Reports are voluntary,
-media attention inflates them, the patient's illness can cause the event,
-and a drug that is mostly taken with others (e.g. in combination products)
-picks up their reports too. Counts are cached in `.faers_cache.json`, so an
-interrupted run resumes where it stopped. The cache is discarded
-automatically when openFDA publishes new data.
+Expect partial agreement. In the closest published benchmark (Courtois et
+al., *Front Pharmacol* 2018;9:1010, French pharmacovigilance database,
+not FAERS), a disproportionality method found 75% of Most-DILI-concern
+drugs and correctly cleared 79% of No-DILI-concern drugs.
+
+Treat FAERS signals as supporting evidence only:
+
+- Reports are voluntary and unverified, and publicity inflates them.
+- A report counts for every drug it lists. The API cannot restrict
+  counts to the drug the reporter suspected, so a drug often taken
+  alongside liver-toxic drugs, or in combination products, picks up their
+  reports.
+- The patient's illness can cause the event (e.g. TB drugs and hepatitis).
+- Reports are not deduplicated.
+
+Counts are cached in `.faers_cache.json`, so an interrupted run resumes
+where it stopped. The cache is discarded automatically when openFDA
+publishes new data, and a release change during a run stops it, so every
+count in one run comes from the same data.
 
 ### Tests
 

@@ -172,3 +172,43 @@ def test_parse_version_1_without_v_prefix(tmp_path):
         ["LT00003", "mercaptopurine", "8", "Warnings and precautions", "Most-DILI-Concern", "1"],
     ]).to_csv(path, header=False, index=False)
     assert [(e.name, e.category) for e in ld.parse(path)] == [("mercaptopurine", "most")]
+
+
+def _two_sheet_workbook(path):
+    v1 = pd.DataFrame([
+        ["Drug Induced Liver Injury Rank (DILIrank) Dataset | FDA", None, None, None, None, None],
+        ["LTKBID", "Compound Name", "Severity Class", "Label Section", "vDILIConcern", "Version"],
+        ["LT00917", "Atracurium", "0", "No match", "No-DILI-Concern", "2"],
+    ])
+    v2 = pd.DataFrame([
+        ["Drug Induced Liver Injury Rank (DILIrank) Dataset Ver 2.0 | FDA", None, None, None, None, None],
+        ["LTKBID", "CompoundName", "SeverityClass", "LabelSection", "vDILI-Concern", "Comment"],
+        ["LT00917", "Atracurium", "0", "No match", "vNo-DILI-Concern", "Unchanged"],
+        ["LT00486", "Polidocanol", "0", "No match", "Ambiguous-DILI-concern", "New"],
+    ])
+    with pd.ExcelWriter(path) as w:  # 'version 1' first, to prove the choice is by name
+        v1.to_excel(w, sheet_name="version 1", header=False, index=False)
+        v2.to_excel(w, sheet_name="version 2", header=False, index=False)
+
+
+def test_two_sheet_workbook_prefers_version_2(tmp_path):
+    path = tmp_path / "Drug Induced Liver Injury Rank (DILIrank 2.0) Dataset  FDA.xlsx"
+    _two_sheet_workbook(path)
+    assert ld.resolve_sheet(path) == "version 2"
+    entries = ld.parse(path)
+    assert [(e.name, e.category, e.comment) for e in entries] == [
+        ("Atracurium", "no", "Unchanged"), ("Polidocanol", "ambiguous", "New")]
+
+    old = ld.parse(path, sheet="version 1")
+    assert [(e.name, e.category, e.comment) for e in old] == [("Atracurium", "no", None)]
+    with pytest.raises(ValueError, match="no sheet"):
+        ld.resolve_sheet(path, "version 3")
+
+
+def test_main_dry_run(tmp_path, capsys):
+    path = tmp_path / "d.xlsx"
+    _two_sheet_workbook(path)
+    ld.main(["--file", str(path), "--dry-run"])
+    out = capsys.readouterr().out
+    assert "Read 2 drugs" in out and "sheet 'version 2'" in out
+    assert "1 no, 1 ambiguous" in out

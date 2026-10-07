@@ -24,10 +24,14 @@ def quote(value: str) -> str:
 
 
 def any_of(field: str, values: list[str]) -> str:
-    """Search clause matching reports where `field` equals any of `values`."""
+    """Search clause matching reports where `field` matches any of `values`.
+
+    Spaces become '+' in the URL, which openFDA reads as spaces; a literal
+    '+' would be sent as %2B and break the query, so none is used here.
+    """
     if not values:
         raise ValueError("any_of needs at least one value")
-    return f"{field}:({' '.join(quote(v) for v in values)})"
+    return f"{field}:({' OR '.join(quote(v) for v in values)})"
 
 
 class OpenFDA:

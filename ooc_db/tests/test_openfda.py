@@ -12,7 +12,7 @@ def client(session, **kw):
 
 def test_search_building():
     assert quote("  hepatic   failure ") == '"hepatic failure"'
-    assert any_of("f", ["A", "B C"]) == 'f:("A" "B C")'
+    assert any_of("f", ["A", "B C"]) == 'f:("A" OR "B C")'
     with pytest.raises(ValueError):
         quote('bad"name')
     with pytest.raises(ValueError):

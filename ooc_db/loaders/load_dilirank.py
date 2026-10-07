@@ -8,10 +8,15 @@ injury (DILI) in humans, based on FDA drug labels and the literature:
     No-DILI-concern     -> negative
     Ambiguous           -> ambiguous (not scored)
 
-Download the spreadsheet from the FDA Liver Toxicity Knowledge Base page
-(search "DILIrank dataset fda.gov"), then run, from the ooc_db folder:
+Run from the ooc_db folder, either downloading the current DILIrank 2.0
+file from the FDA or using a copy you downloaded yourself:
 
+    python -m loaders.load_dilirank --download
     python -m loaders.load_dilirank --file DILIrank.xlsx
+
+The DILIrank 2.0 workbook has two sheets, 'version 2' (current, 1,336
+drugs) and 'version 1' (the original 1,036); 'version 2' is used unless you
+pass --sheet.
 
 Re-running it updates existing DILIrank rows instead of duplicating them.
 """
@@ -31,6 +36,8 @@ import pandas as pd
 from loaders import db
 
 SOURCE = "DILIrank"
+DOWNLOAD_URL = "https://www.fda.gov/media/113052/download"
+PREFERRED_SHEET = "version 2"
 CITATION = (
     "Chen M, Suzuki A, Thakkar S, Yu K, Hu C, Tong W. DILIrank: the largest "
     "reference drug list ranked by the risk for developing drug-induced liver "
@@ -47,6 +54,7 @@ class Entry:
     ltkbid: str | None = None
     severity: str | None = None
     label_section: str | None = None
+    comment: str | None = None   # DILIrank 2.0: Unchanged / New / Revised
 
 
 def _key(text: object) -> str:
@@ -67,16 +75,38 @@ def _category(raw: str) -> str | None:
     raise ValueError(f"Unrecognised DILI concern category: {raw!r}")
 
 
-def _read_table(path: pathlib.Path) -> pd.DataFrame:
-    if path.suffix.lower() in (".csv", ".txt", ".tsv"):
+def _is_text(path: pathlib.Path) -> bool:
+    return path.suffix.lower() in (".csv", ".txt", ".tsv")
+
+
+def resolve_sheet(path: pathlib.Path, sheet: str | None = None) -> str | None:
+    """The worksheet to read: `sheet` if given, else 'version 2' if present, else the first."""
+    if _is_text(path):
+        return None
+    with pd.ExcelFile(path) as book:
+        if sheet is None:
+            return PREFERRED_SHEET if PREFERRED_SHEET in book.sheet_names else book.sheet_names[0]
+        if sheet not in book.sheet_names:
+            raise ValueError(f"{path}: no sheet {sheet!r}; sheets are {book.sheet_names}")
+        return sheet
+
+
+def _read_table(path: pathlib.Path, sheet: str | None) -> pd.DataFrame:
+    if _is_text(path):
         sep = "\t" if path.suffix.lower() == ".tsv" else ","
         return pd.read_csv(path, header=None, dtype=str, sep=sep, keep_default_na=False)
-    return pd.read_excel(path, header=None, dtype=str, keep_default_na=False)
+    return pd.read_excel(path, sheet_name=resolve_sheet(path, sheet), header=None, dtype=str,
+                         keep_default_na=False)
 
 
-def parse(path: pathlib.Path) -> list[Entry]:
-    """Read DILIrank entries, finding the header row and columns by name."""
-    raw = _read_table(path)
+def parse(path: pathlib.Path, sheet: str | None = None) -> list[Entry]:
+    """Read DILIrank entries, finding the header row and columns by name.
+
+    Handles the DILIrank 1.0 and 2.0 spellings ('Compound Name' or
+    'CompoundName', 'vDILIConcern' or 'vDILI-Concern', with or without the
+    'v' prefix on categories, any capitalisation).
+    """
+    raw = _read_table(path, sheet)
 
     header_row = None
     for i in range(min(len(raw), 20)):
@@ -101,6 +131,7 @@ def parse(path: pathlib.Path) -> list[Entry]:
     id_col = column("ltkbid", required=False)
     severity_col = column(contains="severity", required=False)
     label_col = column(contains="labelsection", required=False)
+    comment_col = column("comment", required=False)
 
     def cell(row, col):
         if col is None:
@@ -124,6 +155,7 @@ def parse(path: pathlib.Path) -> list[Entry]:
             ltkbid=cell(row, id_col),
             severity=cell(row, severity_col),
             label_section=cell(row, label_col),
+            comment=cell(row, comment_col),
         ))
     if not entries:
         raise ValueError(f"{path}: no DILIrank entries found")
@@ -147,7 +179,7 @@ def merge_duplicates(entries: list[Entry]) -> tuple[list[Entry], list[str]]:
             )
             first = Entry(first.name, "ambiguous",
                           " / ".join(e.raw_category for e in group), first.ltkbid,
-                          first.severity, first.label_section)
+                          first.severity, first.label_section, first.comment)
         merged.append(first)
     return merged, warnings
 
@@ -180,6 +212,8 @@ def load(conn, entries: list[Entry], *, less_concern_as: str = "positive",
             details.append(f"severity class {e.severity}")
         if e.label_section:
             details.append(f"label section: {e.label_section}")
+        if e.comment:
+            details.append(f"DILIrank 2.0: {e.comment}")
 
         db.upsert_reference(conn, {
             "drug_id": drug_id,
@@ -200,9 +234,27 @@ def load(conn, entries: list[Entry], *, less_concern_as: str = "positive",
     return stats
 
 
+def download(dest: pathlib.Path = pathlib.Path("DILIrank_2.0.xlsx")) -> pathlib.Path:
+    import requests
+
+    r = requests.get(DOWNLOAD_URL, params={"attachment": ""}, timeout=120,
+                     headers={"User-Agent": "ooc-db-loader"})
+    r.raise_for_status()
+    if not r.content.startswith(b"PK"):  # .xlsx files are zip archives
+        sys.exit(f"The FDA returned something other than a spreadsheet from {DOWNLOAD_URL}. "
+                 "Download it in a browser and use --file instead.")
+    dest.write_bytes(r.content)
+    print(f"Downloaded {len(r.content):,} bytes to {dest}")
+    return dest
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--file", required=True, type=pathlib.Path, help="DILIrank .xlsx or .csv")
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--file", type=pathlib.Path, help="DILIrank .xlsx or .csv")
+    src.add_argument("--download", action="store_true",
+                     help=f"download DILIrank 2.0 from the FDA ({DOWNLOAD_URL}) and keep a copy")
+    p.add_argument("--sheet", help=f"worksheet to read (default: '{PREFERRED_SHEET}' if present)")
     p.add_argument("--dsn", help=f"database URL (default: ${db.DSN_ENV})")
     p.add_argument("--less-concern-as", choices=("positive", "ambiguous", "negative"), default="positive",
                    help="verdict for Less-DILI-concern drugs (default: positive)")
@@ -211,11 +263,14 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--dry-run", action="store_true", help="parse and report, write nothing")
     args = p.parse_args(argv)
 
-    entries, warnings = merge_duplicates(parse(args.file))
+    path = download() if args.download else args.file
+    sheet = resolve_sheet(path, args.sheet)
+    entries, warnings = merge_duplicates(parse(path, sheet))
     for w in warnings:
         print("warning:", w, file=sys.stderr)
     counts = Counter(e.category for e in entries)
-    print(f"Read {len(entries)} drugs from {args.file}: "
+    where = f"{path}" + (f", sheet '{sheet}'" if sheet else "")
+    print(f"Read {len(entries)} drugs from {where}: "
           + ", ".join(f"{counts[c]} {c}" for c in CATEGORIES))
 
     if args.dry_run:

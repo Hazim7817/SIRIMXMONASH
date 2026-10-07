@@ -1,6 +1,41 @@
-# PROVISIONAL - replaced after research
-DRUG-INDUCED LIVER INJURY
-HEPATOTOXICITY
-LIVER INJURY
-HEPATIC FAILURE
-ACUTE HEPATIC FAILURE
+# Drug-induced liver injury, NARROW definition (primary analysis).
+#
+# MedDRA preferred terms (PTs), British spelling, matched exactly in FAERS
+# (case does not matter here; the script upper-cases them). Codes are
+# MedDRA 29.1. All are hepatobiliary PTs that are 'narrow' in the SMQ
+# 'Drug related hepatic disorders - severe events only' (20000007) or its
+# cholestasis sibling, chosen to capture liver injury itself rather than
+# lab abnormalities or other liver disease.
+#
+# Deliberately excluded:
+#   - lab results: ALT/AST increased, Hepatic enzyme increased, Transaminases
+#     increased, Liver function test abnormal, Blood bilirubin increased
+#   - infections: Hepatitis A/B/C/E, Hepatitis B reactivation, Hepatitis viral
+#   - chronic or other causes: Hepatic cirrhosis, Hepatic steatosis,
+#     Ischaemic hepatitis, liver tumours
+#
+# PT lists change between MedDRA versions and the choice of terms changes
+# the results. Compare with dili_extended.txt as a sensitivity analysis.
+
+DRUG-INDUCED LIVER INJURY           # 10072268
+SUSPECTED DRUG-INDUCED LIVER INJURY # 10088572, added in MedDRA 26.0
+HEPATOTOXICITY                      # 10019851
+LIVER INJURY                        # 10067125
+HEPATOCELLULAR INJURY               # 10019837
+CHOLESTATIC LIVER INJURY            # 10067969
+MIXED LIVER INJURY                  # 10066758
+HEPATIC FAILURE                     # 10019663
+ACUTE HEPATIC FAILURE               # 10000804
+SUBACUTE HEPATIC FAILURE            # 10056956
+HEPATITIS FULMINANT                 # 10019772
+HEPATIC NECROSIS                    # 10019692
+HEPATITIS TOXIC                     # 10019795
+HEPATITIS                           # 10019717, non-infectious PT
+HEPATITIS ACUTE                     # 10019727
+HEPATITIS CHOLESTATIC               # 10019754
+HEPATIC CYTOLYSIS                   # 10049199
+
+# Older (AERS-era) reports sometimes carry these lower-level terms.
+HEPATOCELLULAR DAMAGE
+CYTOLYTIC HEPATITIS
+MIXED HEPATOCELLULAR-CHOLESTATIC INJURY
