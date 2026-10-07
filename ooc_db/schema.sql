@@ -17,13 +17,24 @@ SET search_path TO ooc;
 -- ---------------------------------------------------------------------------
 CREATE TABLE drug (
     drug_id        serial PRIMARY KEY,
-    name           text NOT NULL UNIQUE,
+    name           text NOT NULL CHECK (name = btrim(name) AND name <> ''),
     pubchem_cid    integer UNIQUE,          -- use IDs, not names, to match external databases
     inchikey       text UNIQUE,
     human_cmax_um  numeric CHECK (human_cmax_um > 0),  -- peak blood concentration in patients, µM
     cmax_source    text,
     notes          text
 );
+-- 'Acetaminophen' and 'ACETAMINOPHEN' are the same drug.
+CREATE UNIQUE INDEX drug_name_ci ON drug (lower(name));
+
+-- Other names for the same drug, so external sources that spell it
+-- differently (e.g. 'paracetamol', a salt form) still match.
+CREATE TABLE drug_alias (
+    drug_id  integer NOT NULL REFERENCES drug ON DELETE CASCADE,
+    alias    text NOT NULL CHECK (alias = btrim(alias) AND alias <> ''),
+    source   text                           -- where the alias came from
+);
+CREATE UNIQUE INDEX drug_alias_ci ON drug_alias (lower(alias));
 
 
 -- ---------------------------------------------------------------------------
@@ -110,8 +121,21 @@ CREATE TABLE reference_outcome (
     verdict           text NOT NULL CHECK (verdict IN ('positive', 'negative', 'ambiguous')),
     dose_description  text,
     citation          text,
-    use_for_scoring   boolean NOT NULL DEFAULT true
+    use_for_scoring   boolean NOT NULL DEFAULT true,
+    -- How the row was obtained: 'curated' (a person read the source),
+    -- 'database' (imported from a curated database such as DILIrank),
+    -- 'statistical_signal' (computed, e.g. FAERS disproportionality) or
+    -- 'text_mined' (extracted from documents by software, then reviewed).
+    method            text NOT NULL DEFAULT 'curated'
+                      CHECK (method IN ('curated', 'database', 'statistical_signal', 'text_mined')),
+    source_record_id  text,                  -- ID in the source, e.g. DILIrank LTKBID
+    retrieved_on      date
 );
+-- Imported rows are keyed so re-running a loader updates them instead of
+-- adding duplicates. Hand-curated rows have no such limit.
+CREATE UNIQUE INDEX reference_outcome_imported
+    ON reference_outcome (drug_id, endpoint, organ, species, source)
+    WHERE method IN ('database', 'statistical_signal');
 
 
 -- ---------------------------------------------------------------------------
@@ -130,6 +154,38 @@ CREATE TABLE chip_call (
     basis               text,                -- e.g. 'ALT >= 2x control at <= 25x Cmax'
     decided_on          date DEFAULT current_date,
     UNIQUE (drug_id, chip_model_id, endpoint)
+);
+
+
+-- ---------------------------------------------------------------------------
+-- 8. FAERS signals: disproportionality statistics from the FDA Adverse Event
+--    Reporting System, written by loaders/faers_signals.py. Each signal is
+--    also summarised as a reference_outcome row (method 'statistical_signal',
+--    not used for scoring unless you switch it on).
+--    2x2 table: a = reports with the drug and the event, b = drug without
+--    event, c = event without drug, d = neither.
+-- ---------------------------------------------------------------------------
+CREATE TABLE faers_signal (
+    faers_signal_id   serial PRIMARY KEY,
+    drug_id           integer NOT NULL REFERENCES drug ON DELETE CASCADE,
+    event_definition  text NOT NULL,         -- name of the event term set, e.g. 'DILI narrow'
+    event_terms       text[] NOT NULL,       -- MedDRA preferred terms counted as the event
+    drug_query        text NOT NULL,         -- drug name as searched in FAERS
+    a                 bigint NOT NULL CHECK (a >= 0),
+    b                 bigint NOT NULL CHECK (b >= 0),
+    c                 bigint NOT NULL CHECK (c >= 0),
+    d                 bigint NOT NULL CHECK (d >= 0),
+    prr               numeric,
+    prr_lower95       numeric,
+    prr_upper95       numeric,
+    ror               numeric,
+    ror_lower95       numeric,
+    ror_upper95       numeric,
+    chi2_yates        numeric,
+    is_signal         boolean NOT NULL,
+    criteria          text NOT NULL,         -- rule used for is_signal
+    queried_on        date NOT NULL DEFAULT current_date,
+    UNIQUE (drug_id, event_definition)
 );
 
 
@@ -221,3 +277,23 @@ SELECT chip_model, endpoint, species,
            AS accuracy_pct
 FROM v_concordance
 GROUP BY chip_model, endpoint, species;
+
+
+-- How well do FAERS signals agree with DILIrank? A sanity check on the
+-- statistical signals before you rely on them for drugs DILIrank lacks.
+CREATE VIEW v_faers_vs_dilirank AS
+SELECT d.name AS drug, fs.event_definition, fs.a AS n_reports_with_event,
+       round(fs.ror, 2) AS ror, round(fs.ror_lower95, 2) AS ror_lower95,
+       round(fs.prr, 2) AS prr, fs.is_signal AS faers_signal,
+       ro.verdict AS dilirank_verdict, ro.finding AS dilirank_category,
+       CASE
+           WHEN ro.verdict IS NULL OR ro.verdict = 'ambiguous' THEN 'not compared'
+           WHEN fs.is_signal = (ro.verdict = 'positive') THEN 'agree'
+           ELSE 'disagree'
+       END AS agreement
+FROM faers_signal fs
+JOIN drug d USING (drug_id)
+LEFT JOIN reference_outcome ro
+       ON ro.drug_id = fs.drug_id AND ro.source = 'DILIrank'
+      AND ro.endpoint = 'toxicity' AND ro.organ = 'liver' AND ro.species = 'human'
+      AND ro.method = 'database';

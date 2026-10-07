@@ -5,3 +5,6 @@ __pycache__/
 runs/
 predictions/
 data/
+
+# openFDA count cache written by ooc_db/loaders/faers_signals.py
+.faers_cache.json
