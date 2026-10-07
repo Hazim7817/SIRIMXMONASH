@@ -25,6 +25,23 @@ unless you added that folder to your PATH.
 All tables live in the `ooc` schema. Write `ooc.drug`, or run
 `SET search_path TO ooc;` once per session.
 
+### Upgrading
+
+`schema.sql` deletes everything in the `ooc` schema. If your database was
+built with an earlier version and holds data you want to keep, the loader
+scripts will say so. Back up the data, rebuild, and restore it:
+
+```
+pg_dump -U postgres -d ooc --data-only --schema=ooc --exclude-table=ooc.faers_signal -f ooc_backup.sql
+psql -U postgres -d ooc -f schema.sql
+psql -U postgres -d ooc -f ooc_backup.sql
+```
+
+Then re-run the FAERS script, since its statistics are not kept. If the
+restore stops on a rule the new schema adds (for example an organ written
+`Liver` instead of `liver`), fix that row in `ooc_backup.sql` and run the
+last two commands again.
+
 ## Tables
 
 | Table | One row per | Filled from |
@@ -103,9 +120,12 @@ macOS / Linux:
 export OOC_DATABASE_URL='postgresql://postgres:YOUR_PASSWORD@localhost:5432/ooc'
 ```
 
-If the password contains `@ : / # ? %` or spaces, use this form instead:
-`host=localhost port=5432 dbname=ooc user=postgres password=YOUR_PASSWORD`.
-You can also pass either form with `--dsn` on each command.
+If the password contains `@ : / # ? %` or spaces, use this form instead,
+with the password in single quotes (inside them, write `\'` for a quote
+and `\\` for a backslash):
+`host=localhost port=5432 dbname=ooc user=postgres password='YOUR PASSWORD'`.
+Wrap the whole value in double quotes when you set it in PowerShell. You
+can also pass either form with `--dsn` on each command.
 
 ### DILIrank: curated human liver-injury classification
 
@@ -121,7 +141,8 @@ Or download it in a browser from the FDA page "Drug-Induced Liver Injury
 Rank (DILIrank 2.0) Dataset" and pass `--file "path\to\file.xlsx"`. The
 2.0 workbook has a `version 2` sheet (1,336 drugs, used by default) and a
 `version 1` sheet (the original 1,036; `--sheet "version 1"`). Older
-DILIrank 1.0 files and CSV/TXT exports (any Excel encoding) also work.
+DILIrank 1.0 files and Excel CSV/TXT exports (including "Unicode Text"
+and Mac formats) also work.
 
 Every DILIrank drug is added to `drug` (use `--only-existing` to load only
 drugs you already have). Most-DILI-concern drugs become `positive`,
@@ -131,13 +152,14 @@ often leave Less-DILI-concern out instead, which `--less-concern-as
 ambiguous` does.
 
 Each load replaces the previous DILIrank list. Rows are updated, not
-duplicated, and DILIrank rows for drugs missing from the file you load
-(for example after switching from `version 2` to `version 1`) are
-removed. If two DILIrank names turn out to be the same drug in your
-database, through `drug_alias`, they are merged, and marked ambiguous if
-their categories disagree. If you type DILIrank rows by hand, set their
-`method` to `database` so the loader updates them instead of adding a
-second row.
+duplicated, and rows the loader wrote earlier for drugs missing from the
+file you load (for example after switching from `version 2` to
+`version 1`) are removed. If several DILIrank names turn out to be the
+same drug in your database, through `drug_alias`, they are merged: the
+most serious category is kept if their verdicts agree, and the drug is
+marked ambiguous if they do not. Rows you typed by hand with source
+`DILIrank` are never deleted; the loader warns if they duplicate an
+imported row or no longer match a DILIrank name.
 
 ### FAERS: signals from adverse event reports
 
@@ -175,10 +197,14 @@ and other spellings to `drug_alias` if a drug is missed.
 
 Names are matched as words inside longer names, so "estradiol" also counts
 reports of ethinyl estradiol contraceptives, and "acetaminophen" counts
-combination products. The exact search used is saved in
-`faers_signal.drug_query`. Check it for drugs whose name is part of
-another drug's name, and narrow the search with `--drug-field
-generic_name` if needed.
+combination products. The search used is saved in
+`faers_signal.drug_query`. For drugs whose name is part of another drug's
+name, re-run them with `--exact`, which matches whole harmonised names only
+("ESTRADIOL" but not "ETHINYL ESTRADIOL"). Add salt forms ("Estradiol
+valerate") as aliases, and note that `--exact` cannot find drugs openFDA
+has no harmonised name for. Salt words are never stripped down to a bare
+element, so "Lithium citrate" is searched under that name only; add
+"Lithium carbonate" as an alias to include it.
 
 **Which events count.** `loaders/event_terms/dili_narrow.txt` lists the
 MedDRA preferred terms for liver injury itself (e.g. Drug-induced liver
@@ -192,10 +218,17 @@ separately, as source `FAERS (extended terms)`. Term files with other
 names are stored in `faers_signal` only. The script warns about any term
 that matches no reports.
 
-Results go to `faers_signal`. For the two supplied term files a summary row
-also goes to `reference_outcome`, with `use_for_scoring = false`, because
-reporting signals are weaker evidence than DILIrank. Check how far they
-agree:
+Results go to `faers_signal`, with the cut-off and openFDA data release
+used. For the two supplied term files a summary row also goes to
+`reference_outcome`, with `use_for_scoring = false`, because reporting
+signals are weaker evidence than DILIrank. If a drug later returns no
+reports, its statistics are removed and its summary row becomes
+`ambiguous`, keeping your `use_for_scoring` choice.
+
+`v_faers_vs_dilirank` compares signal / no signal with DILIrank. A drug
+without a signal whose expected count was below `--min-expected` is listed
+as `too few reports` rather than counted, since FAERS could not have
+shown a signal for it. Check how far they agree:
 
 ```sql
 SELECT event_definition, agreement, count(*)
@@ -210,11 +243,15 @@ correctly cleared about 79% of No-DILI-concern drugs. It left
 Less-DILI-concern drugs out, so compare like with like:
 
 ```sql
-SELECT event_definition, dilirank_class, faers_verdict, count(*)
+SELECT event_definition, dilirank_class,
+       round(100.0 * avg(faers_signal::int), 1) AS pct_with_signal, count(*) AS drugs
 FROM ooc.v_faers_vs_dilirank
-WHERE dilirank_class IN ('most', 'no')
-GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;
+WHERE dilirank_class IN ('most', 'no') AND agreement <> 'too few reports'
+GROUP BY 1, 2 ORDER BY 1, 2;
 ```
+
+`pct_with_signal` for `most` corresponds to the 75% above, and 100 minus
+it for `no` to the 79%.
 
 Treat FAERS signals as supporting evidence only:
 
