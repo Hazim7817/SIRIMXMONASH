@@ -47,7 +47,15 @@ DRUG_FIELDS = {
     "generic_name": "patient.drug.openfda.generic_name",
     "medicinalproduct": "patient.drug.medicinalproduct",
     "activesubstance": "patient.drug.activesubstance.activesubstancename",
+    # Whole-name matches on openFDA's harmonised names (--exact): 'ESTRADIOL'
+    # does not match 'ETHINYL ESTRADIOL', but salt forms ('ESTRADIOL
+    # VALERATE') need their own drug_alias, and drugs openFDA could not
+    # harmonise (often withdrawn ones) are not found at all.
+    "generic_name_exact": "patient.drug.openfda.generic_name.exact",
+    "substance_name_exact": "patient.drug.openfda.substance_name.exact",
 }
+WORD_FIELDS = ["generic_name", "medicinalproduct", "activesubstance"]
+EXACT_FIELDS = ["generic_name_exact", "substance_name_exact"]
 # Which reference_outcome row each event definition (term file name) feeds.
 EVENT_SCOPE = {
     "dili_narrow": ("toxicity", "liver", "FAERS"),
@@ -64,13 +72,24 @@ SALT_WORDS = {
     "tosylate", "trihydrate",
 }
 # Elements and inorganic ions: a bare one would match unrelated products
-# ('Silver nitrate' -> 'Silver' would match silver sulfadiazine).
-BARE_ELEMENTS = {
-    "aluminum", "aluminium", "ammonium", "barium", "bismuth", "cadmium", "cesium", "chromic",
-    "cobalt", "copper", "cupric", "ferric", "ferrous", "gallium", "gold", "iron", "lithium",
-    "manganese", "mercuric", "mercurous", "silver", "stannous", "strontium", "thallium",
-    "thallous", "zinc",
-}
+# ('Silver nitrate' -> 'Silver' would match silver sulfadiazine), so a name
+# is never reduced to one of these.
+BARE_ELEMENTS = set("""
+    actinium aluminium aluminum americium antimony argon arsenic astatine barium berkelium
+    beryllium bismuth bohrium boron bromine cadmium caesium calcium californium carbon cerium
+    cesium chlorine chromium cobalt copernicium copper curium darmstadtium dubnium dysprosium
+    einsteinium erbium europium fermium flerovium fluorine francium gadolinium gallium germanium
+    gold hafnium hassium helium holmium hydrogen indium iodine iridium iron krypton lanthanum
+    lawrencium lead lithium livermorium lutetium magnesium manganese meitnerium mendelevium
+    mercury molybdenum moscovium neodymium neon neptunium nickel nihonium niobium nitrogen
+    nobelium oganesson osmium oxygen palladium phosphorus platinum plutonium polonium potassium
+    praseodymium promethium protactinium radium radon rhenium rhodium roentgenium rubidium
+    ruthenium rutherfordium samarium scandium seaborgium selenium silicon silver sodium
+    strontium sulfur sulphur tantalum technetium tellurium tennessine terbium thallium thorium
+    thulium tin titanium tungsten uranium vanadium xenon ytterbium yttrium zinc zirconium
+    ammonium chromic cupric cuprous ferric ferrous mercuric mercurous stannic stannous
+    thallous vanadyl
+""".split())
 
 
 def read_terms(path: pathlib.Path) -> list[str]:
@@ -144,8 +163,16 @@ def names_for(conn, drug_id: int, name: str) -> list[str]:
 
 
 def drug_clause(fields: list[str], names: list[str]) -> str:
-    """Reports where any of the name fields matches any of the names."""
-    return "(" + " OR ".join(any_of(DRUG_FIELDS[f], names) for f in fields) + ")"
+    """Reports where any of the name fields matches any of the names.
+
+    Exact fields hold upper-case values, so names are upper-cased for them.
+    """
+    clauses = []
+    for f in fields:
+        field = DRUG_FIELDS[f]
+        values = [n.upper() for n in names] if field.endswith(".exact") else names
+        clauses.append(any_of(field, list(dict.fromkeys(values))))
+    return "(" + " OR ".join(clauses) + ")"
 
 
 def check_terms(client: OpenFDA, terms: list[str]) -> list[str]:
@@ -190,17 +217,19 @@ def verdict(res: DrugResult, min_expected: float) -> str:
     return "ambiguous"
 
 
-def clear(conn, drug_id: int, event_definition: str) -> None:
-    """Remove earlier results for a drug that no longer returns any reports."""
+def clear(conn, res: DrugResult, event_definition: str, today: dt.date) -> None:
+    """A drug that now returns no reports: drop its old statistics and mark
+    its FAERS reference row ambiguous, keeping your use_for_scoring choice."""
     conn.execute("DELETE FROM faers_signal WHERE drug_id = %s AND event_definition = %s",
-                 (drug_id, event_definition))
+                 (res.drug_id, event_definition))
     if event_definition in EVENT_SCOPE:
         endpoint, organ, source = EVENT_SCOPE[event_definition]
         conn.execute(
-            """DELETE FROM reference_outcome
+            """UPDATE reference_outcome SET verdict = 'ambiguous', retrieved_on = %s,
+                      finding = 'No FAERS reports found for: ' || %s
                WHERE drug_id = %s AND source = %s AND endpoint = %s AND organ = %s
                  AND species = 'human' AND method = 'statistical_signal'""",
-            (drug_id, source, endpoint, organ))
+            (today, res.drug_query, res.drug_id, source, endpoint, organ))
 
 
 def save(conn, res: DrugResult, *, event_definition: str, terms: list[str], criterion: str,
@@ -213,8 +242,8 @@ def save(conn, res: DrugResult, *, event_definition: str, terms: list[str], crit
         INSERT INTO faers_signal
             (drug_id, event_definition, event_terms, drug_query, a, b, c, d, expected_a,
              prr, prr_lower95, prr_upper95, ror, ror_lower95, ror_upper95,
-             chi2_yates, is_signal, criteria, verdict, queried_on)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             chi2_yates, is_signal, criteria, verdict, min_expected, faers_updated, queried_on)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (drug_id, event_definition) DO UPDATE SET
             event_terms = EXCLUDED.event_terms, drug_query = EXCLUDED.drug_query,
             a = EXCLUDED.a, b = EXCLUDED.b, c = EXCLUDED.c, d = EXCLUDED.d,
@@ -222,11 +251,14 @@ def save(conn, res: DrugResult, *, event_definition: str, terms: list[str], crit
             prr = EXCLUDED.prr, prr_lower95 = EXCLUDED.prr_lower95, prr_upper95 = EXCLUDED.prr_upper95,
             ror = EXCLUDED.ror, ror_lower95 = EXCLUDED.ror_lower95, ror_upper95 = EXCLUDED.ror_upper95,
             chi2_yates = EXCLUDED.chi2_yates, is_signal = EXCLUDED.is_signal,
-            criteria = EXCLUDED.criteria, verdict = EXCLUDED.verdict, queried_on = EXCLUDED.queried_on
+            criteria = EXCLUDED.criteria, verdict = EXCLUDED.verdict,
+            min_expected = EXCLUDED.min_expected, faers_updated = EXCLUDED.faers_updated,
+            queried_on = EXCLUDED.queried_on
         """,
         (res.drug_id, event_definition, terms, res.drug_query, t.a, t.b, t.c, t.d, expected,
          s.prr, s.prr_lower95, s.prr_upper95, s.ror, s.ror_lower95, s.ror_upper95,
-         s.chi2_yates, res.signal, CRITERIA[criterion], res_verdict, today),
+         s.chi2_yates, res.signal, CRITERIA[criterion], res_verdict, min_expected, last_updated,
+         today),
     )
     if event_definition not in EVENT_SCOPE:
         return  # unknown organ/endpoint: keep the statistics only
@@ -262,7 +294,11 @@ def main(argv: list[str] | None = None) -> None:
                         "Only dili_narrow.txt and dili_extended.txt also write a reference_outcome "
                         "row; other files are stored in faers_signal only")
     p.add_argument("--drug-field", action="append", dest="drug_fields", choices=sorted(DRUG_FIELDS),
-                   help="drug name field to search (repeatable; default: all three)")
+                   help="drug name field to search (repeatable; default: "
+                        + ", ".join(WORD_FIELDS) + ")")
+    p.add_argument("--exact", action="store_true",
+                   help="match whole harmonised names only (" + ", ".join(EXACT_FIELDS) + "), for "
+                        "drugs whose name is part of another's, e.g. estradiol / ethinyl estradiol")
     # argparse treats % in help text as a format character, hence the escaping.
     p.add_argument("--criterion", choices=sorted(CRITERIA), default="ror",
                    help="signal rule: " + "; ".join(f"{k} = {v}" for k, v in CRITERIA.items())
@@ -283,7 +319,7 @@ def main(argv: list[str] | None = None) -> None:
               f"{', '.join(n + '.txt' for n in EVENT_SCOPE)}; results go to faers_signal only "
               f"(as event_definition '{event_definition}'), with no reference_outcome row.",
               file=sys.stderr)
-    drug_fields = args.drug_fields or list(DRUG_FIELDS)
+    drug_fields = args.drug_fields or (EXACT_FIELDS if args.exact else WORD_FIELDS)
     client = OpenFDA(api_key=args.api_key, cache_path=args.cache)
     today = dt.date.today()
 
@@ -314,7 +350,7 @@ def main(argv: list[str] | None = None) -> None:
                               drug_fields=drug_fields, event_search=event_search,
                               n_total=n_total, n_event=n_event, criterion=args.criterion)
                 if res.table is None:
-                    clear(conn, drug_id, event_definition)
+                    clear(conn, res, event_definition, today)
                     conn.commit()
                     print(f"[{i}/{len(drugs)}] {name}: {res.note}")
                     continue

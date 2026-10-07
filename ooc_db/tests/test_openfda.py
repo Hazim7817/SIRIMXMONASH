@@ -117,7 +117,35 @@ def test_api_key_is_redacted_from_errors():
         client(Down({}), api_key="SECRET/KEY+1", max_retries=0).count(None)
     assert "SECRET" not in str(e.value) and "***" in str(e.value)
 
-    s = FakeSession({}, failures=[403])
-    with pytest.raises(OpenFDAError) as e:
-        client(s, api_key="SECRETKEY").count(None)
-    assert "SECRETKEY" not in str(e.value)
+    class Page:
+        def __init__(self, status, text):
+            self.status_code, self.text = status, text
+
+        def json(self):
+            raise ValueError("not json")
+
+    class EchoesKey(FakeSession):
+        def get(self, url, params, timeout):
+            return Page(self.status, f"<html>Blocked: {url}?api_key={params['api_key']}</html>")
+
+    for status in (403, 200):  # an error page, and a 200 'success' page from a proxy
+        s = EchoesKey({})
+        s.status = status
+        with pytest.raises(OpenFDAError) as e:
+            client(s, api_key="SECRETKEY", max_retries=0).count(None)
+        assert "SECRETKEY" not in str(e.value) and "***" in str(e.value), status
+
+
+def test_cache_saves_use_a_per_process_temporary_file(tmp_path, monkeypatch):
+    import os
+    seen = []
+    real_replace = os.replace
+    monkeypatch.setattr(os, "replace", lambda a, b: (seen.append(str(a)), real_replace(a, b)))
+    client(FakeSession({None: 1}), cache_path=tmp_path / "c.json").count(None)
+    assert seen and all(f".{os.getpid()}.tmp" in name for name in seen)
+
+
+def test_failed_cache_save_is_only_a_warning(tmp_path, capsys):
+    blocked = tmp_path / "no_such_dir" / "c.json"
+    assert client(FakeSession({None: 3}), cache_path=blocked).count(None) == 3
+    assert "could not save cache" in capsys.readouterr().err

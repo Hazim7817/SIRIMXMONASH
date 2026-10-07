@@ -94,13 +94,20 @@ class OpenFDA:
         self._save()
 
     def _save(self) -> None:
-        """Write the cache to a temporary file, then swap it in, so an
-        interruption never leaves a half-written cache."""
-        if self.cache_path:
-            tmp = self.cache_path.with_name(self.cache_path.name + ".tmp")
+        """Write the cache to a temporary file of this run's own, then swap
+        it in, so an interruption never leaves a half-written cache and two
+        runs sharing a cache do not trip over each other. The cache is only
+        an optimisation, so a failed save is a warning, not an error."""
+        if not self.cache_path:
+            return
+        tmp = self.cache_path.with_name(f"{self.cache_path.name}.{os.getpid()}.tmp")
+        try:
             tmp.write_text(json.dumps(
                 {"last_updated": self.last_updated, "counts": self.counts}, indent=0, sort_keys=True))
             os.replace(tmp, self.cache_path)
+        except OSError as e:
+            print(f"warning: could not save cache {self.cache_path} ({e})", file=sys.stderr)
+            tmp.unlink(missing_ok=True)
 
     def _live_count(self, search: str | None) -> int:
         params = {"limit": 1}
@@ -136,7 +143,7 @@ class OpenFDA:
                         meta = r.json()["meta"]
                         return int(meta["results"]["total"]), meta.get("last_updated")
                     except (ValueError, KeyError, TypeError) as e:
-                        error = f"unexpected response from openFDA ({e!r}): {r.text[:300]}"
+                        error = self._redact(f"unexpected response from openFDA ({e!r}): {r.text[:300]}")
                 else:
                     body = _json_or_none(r)
                     err = body.get("error") if isinstance(body, dict) else None

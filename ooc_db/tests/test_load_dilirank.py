@@ -249,15 +249,31 @@ def test_two_names_for_one_drug_via_alias(conn, capsys):
     conflicting = [ld.Entry("Diclofenac", "most", "vMost-DILI-concern", "LT1"),
                    ld.Entry("Diclofenac sodium", "no", "vNo-DILI-concern", "LT2")]
     stats = ld.load(conn, conflicting)
-    assert "same drug in the database" in capsys.readouterr().err
+    assert "different verdicts for one drug" in capsys.readouterr().err
     assert stats["merged: conflicting names for one drug"] == 1
-    assert _refs(conn) == [("Diclofenac", "ambiguous", "LT2", True)]
+    assert _refs(conn) == [("Diclofenac", "ambiguous", "LT1", True)]
 
-    agreeing = [ld.Entry("Diclofenac", "most", "vMost-DILI-concern", "LT1"),
+    # Same verdict: merged quietly, keeping the more serious category
+    agreeing = [ld.Entry("Diclofenac", "less", "vLess-DILI-concern", "LT1"),
                 ld.Entry("Diclofenac sodium", "most", "vMost-DILI-concern", "LT2")]
     stats = ld.load(conn, agreeing)
     assert stats["merged: same drug under two names"] == 1
-    assert _refs(conn) == [("Diclofenac", "positive", "LT1", True)]
+    assert _refs(conn) == [("Diclofenac", "positive", "LT2", True)]
+    assert capsys.readouterr().err == ""
+
+
+def test_three_names_for_one_drug(conn, capsys):
+    drug_id = conn.execute("INSERT INTO drug (name) VALUES ('Paracetamol') RETURNING drug_id").fetchone()[0]
+    for alias in ("Acetaminophen", "Paracetamol sodium"):
+        conn.execute("INSERT INTO drug_alias (drug_id, alias) VALUES (%s, %s)", (drug_id, alias))
+    ld.load(conn, [ld.Entry("Paracetamol", "most", "vMost-DILI-concern", "LT1"),
+                   ld.Entry("Acetaminophen", "no", "vNo-DILI-concern", "LT2"),
+                   ld.Entry("Paracetamol sodium", "no", "vNo-DILI-concern", "LT3")])
+    err = capsys.readouterr().err
+    assert err.count("warning") == 1
+    assert all(n in err for n in ("'Paracetamol'", "'Acetaminophen'", "'Paracetamol sodium'"))
+    finding = conn.execute("SELECT finding FROM reference_outcome").fetchone()[0]
+    assert finding.startswith("vMost-DILI-concern / vNo-DILI-concern / vNo-DILI-concern")
 
 
 def test_loading_a_smaller_list_removes_drugs_not_in_it(conn, tmp_path):
@@ -270,12 +286,20 @@ def test_loading_a_smaller_list_removes_drugs_not_in_it(conn, tmp_path):
     assert conn.execute("SELECT count(*) FROM drug WHERE name = 'Polidocanol'").fetchone()[0] == 1
 
 
-def test_hand_entered_dilirank_rows_are_flagged(conn, capsys):
-    drug_id = conn.execute("INSERT INTO drug (name) VALUES ('Buspirone') RETURNING drug_id").fetchone()[0]
-    conn.execute("""INSERT INTO reference_outcome (drug_id, endpoint, organ, species, source, verdict)
-                    VALUES (%s, 'toxicity', 'liver', 'human', 'DILIrank', 'negative')""", (drug_id,))
-    ld.load(conn, [ld.Entry("Buspirone", "no", "vNo-DILI-concern")])
-    assert "hand-entered reference rows" in capsys.readouterr().err
+def test_hand_entered_dilirank_rows_are_flagged_and_kept(conn, capsys):
+    for name in ("Buspirone", "Paracetamol"):
+        conn.execute("INSERT INTO drug (name) VALUES (%s)", (name,))
+    conn.execute("""INSERT INTO reference_outcome (drug_id, endpoint, organ, species, source, verdict, method)
+                    VALUES (1, 'toxicity', 'liver', 'human', 'DILIrank', 'negative', 'curated'),
+                           (2, 'toxicity', 'liver', 'human', 'DILIrank', 'positive', 'database')""")
+    ld.load(conn, [ld.Entry("Buspirone", "no", "vNo-DILI-concern"),
+                   ld.Entry("acetaminophen", "most", "vMost-DILI-concern")])
+    err = capsys.readouterr().err
+    assert "sit next to the imported rows" in err          # Buspirone: curated + imported
+    assert "drugs this file did not update" in err         # Paracetamol: spelled differently
+    # the hand-typed Paracetamol row survives the reload (it was not written by the loader)
+    assert conn.execute("""SELECT count(*) FROM reference_outcome r JOIN drug d USING (drug_id)
+                           WHERE d.name = 'Paracetamol'""").fetchone()[0] == 1
 
 
 def test_download_failure_gives_advice(monkeypatch):
@@ -293,3 +317,15 @@ def test_name_whitespace_is_normalised(conn):
     entries = [ld.Entry("Aminosalicylic  acid", "less", "vLess-DILI-concern")]
     ld.load(conn, entries)
     assert conn.execute("SELECT name FROM drug").fetchall() == [("Aminosalicylic acid",)]
+
+
+def test_mac_line_endings_utf16_and_semicolons_in_names(tmp_path):
+    rows = ["LTKBID,Compound Name,vDILIConcern", 'LT1,"A; B; C; D; E",vNo-DILI-Concern',
+            "LT2,acetaminophen,vMost-DILI-Concern"]
+    cr = tmp_path / "mac.csv"
+    cr.write_bytes("\r".join(rows).encode("ascii"))
+    utf16 = tmp_path / "unicode.txt"
+    utf16.write_bytes("\r\n".join(r.replace(",", "\t").replace('"', "") for r in rows).encode("utf-16"))
+    for path in (cr, utf16):
+        assert [(e.name, e.category) for e in ld.parse(path)] == [
+            ("A; B; C; D; E", "no"), ("acetaminophen", "most")], path.name

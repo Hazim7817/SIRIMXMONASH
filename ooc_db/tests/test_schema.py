@@ -92,8 +92,39 @@ def test_concordance_keeps_calls_without_a_clear_reference(conn):
                        "nothing": "no reference", "mixed": "false positive"}
     perf = {r[0]: r[1:] for r in conn.execute(
         "SELECT species, tp, fp, not_scored, no_reference, accuracy_pct FROM v_performance")}
-    assert perf["human"][:4] == (1, 1, 1, 0) and float(perf["human"][4]) == 50.0
-    assert perf[None][3] == 1
+    assert perf["human"][:4] == (1, 1, 1, 1) and float(perf["human"][4]) == 50.0
+
+
+def test_missing_reference_for_a_species_is_counted_on_that_species(conn):
+    conn.execute("INSERT INTO chip_model (name, organ) VALUES ('c', 'liver')")
+    _chip_call(conn, "rat only")
+    _chip_call(conn, "both")
+    _ref(conn, "rat only", "positive", species="rat")
+    _ref(conn, "both", "positive", species="rat")
+    _ref(conn, "both", "positive", species="human")
+    perf = {r[0]: r[1:] for r in conn.execute("SELECT species, tp, no_reference FROM v_performance")}
+    assert perf == {"human": (1, 1), "rat": (2, 0)}
+
+
+def test_consensus_lists_only_the_sources_behind_the_verdict(conn):
+    conn.execute("INSERT INTO drug (name) VALUES ('d')")
+    _ref(conn, "d", "ambiguous", "DILIrank")
+    _ref(conn, "d", "positive", "LiverTox")
+    assert conn.execute("SELECT verdict, sources, n_findings FROM v_reference_consensus").fetchone() == (
+        "positive", "LiverTox", 1)
+
+
+def test_schema_works_without_search_path(conn):
+    conn.execute("RESET search_path")
+    conn.execute("INSERT INTO ooc.drug (name) VALUES ('Aspirin')")
+    conn.execute("INSERT INTO ooc.drug_alias (drug_id, alias) VALUES (1, 'ASA')")
+    rejects(conn, "INSERT INTO ooc.drug (name) VALUES ('asa')")
+
+
+def test_interior_whitespace_rejected(conn):
+    for name in ("Valproic  acid", "Valproic\u00a0acid", "Valproic\tacid"):
+        rejects(conn, "INSERT INTO drug (name) VALUES (%s)", (name,))
+    conn.execute("INSERT INTO drug (name) VALUES ('Riboflavin 5''-phosphate')")
 
 
 def test_conflicting_sources_are_not_scored(conn):

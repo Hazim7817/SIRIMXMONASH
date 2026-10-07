@@ -55,7 +55,7 @@ def test_drug_clause_searches_every_field_with_or():
 
 TERMS = ["HEPATOTOXICITY", "LIVER INJURY"]
 EVENT = any_of(fs.EVENT_FIELD, TERMS)
-ALL_FIELDS = list(fs.DRUG_FIELDS)
+ALL_FIELDS = fs.WORD_FIELDS
 
 
 def drug(*names):
@@ -216,8 +216,8 @@ def test_stale_results_removed_when_drug_has_no_reports(run, conn, tmp_path):
         "SELECT d.name FROM faers_signal JOIN drug d USING (drug_id)")}
     assert left == {"buspirone", "rarely used"}
     assert conn.execute(
-        """SELECT count(*) FROM reference_outcome r JOIN drug d USING (drug_id)
-           WHERE d.name = 'Troglitazone' AND r.source = 'FAERS'""").fetchone()[0] == 0
+        """SELECT r.verdict FROM reference_outcome r JOIN drug d USING (drug_id)
+           WHERE d.name = 'Troglitazone' AND r.source = 'FAERS'""").fetchall() == [("ambiguous",)]
 
 
 def test_signal_row_records_query_expected_count_and_verdict(run, conn):
@@ -242,7 +242,7 @@ def test_unknown_term_file_is_announced(conn, tmp_path, monkeypatch, capsys):
     assert "faers_signal only" in capsys.readouterr().err
 
 
-def test_view_does_not_compare_underpowered_drugs(run, conn, tmp_path):
+def test_view_compares_signals_and_sets_aside_underpowered_drugs(run, conn, tmp_path):
     import pandas as pd
     path = tmp_path / "d.csv"
     pd.DataFrame([["Compound Name", "vDILIConcern"],
@@ -252,9 +252,71 @@ def test_view_does_not_compare_underpowered_drugs(run, conn, tmp_path):
     ld.load(conn, ld.parse(path))
     run("--source", "DILIrank")
     view = {r[0]: r[1:] for r in conn.execute(
-        "SELECT drug, faers_verdict, dilirank_class, agreement FROM v_faers_vs_dilirank")}
+        "SELECT drug, faers_signal, faers_verdict, dilirank_class, agreement FROM v_faers_vs_dilirank")}
     assert view == {
-        "Troglitazone": ("positive", "most", "agree"),
-        "buspirone": ("negative", "less", "disagree"),
-        "rarely used": ("ambiguous", "no", "not compared"),  # 40 reports: too few to call
+        "Troglitazone": (True, "positive", "most", "agree"),
+        "buspirone": (False, "negative", "less", "disagree"),
+        "rarely used": (False, "ambiguous", "no", "too few reports"),  # 0.1 reports expected
     }
+
+
+def test_view_compares_well_powered_drugs_with_a_small_excess(conn):
+    # 70 seen, 60 expected: no signal, not 'negative' (a > expected), but well
+    # powered, so the DILIrank comparison still counts it as 'no signal'.
+    conn.execute("INSERT INTO drug (name) VALUES ('d')")
+    conn.execute("""INSERT INTO reference_outcome (drug_id, endpoint, organ, species, source, finding,
+                    verdict, method, citation)
+                    VALUES (1, 'toxicity', 'liver', 'human', 'DILIrank', 'vNo-DILI-concern', 'negative',
+                            'database', %s)""", (ld.CITATION,))
+    conn.execute("""INSERT INTO faers_signal (drug_id, event_definition, event_terms, drug_query, a, b, c, d,
+                    expected_a, is_signal, criteria, verdict, min_expected)
+                    VALUES (1, 'dili_narrow', '{X}', 'q', 70, 19930, 29930, 9950070, 60, false, 'ror',
+                            'ambiguous', 5)""")
+    assert conn.execute("SELECT faers_verdict, agreement FROM v_faers_vs_dilirank").fetchone() == (
+        "ambiguous", "agree")
+
+
+def test_hand_typed_dilirank_rows_are_compared(conn):
+    conn.execute("INSERT INTO drug (name) VALUES ('Ketoconazole')")
+    conn.execute("""INSERT INTO reference_outcome (drug_id, endpoint, organ, species, source, finding, verdict)
+                    VALUES (1, 'toxicity', 'liver', 'human', 'DILIrank', 'Most-DILI-concern', 'positive')""")
+    conn.execute("""INSERT INTO faers_signal (drug_id, event_definition, event_terms, drug_query, a, b, c, d,
+                    expected_a, is_signal, criteria, verdict, min_expected)
+                    VALUES (1, 'dili_narrow', '{X}', 'q', 50, 950, 1000, 98000, 10, true, 'ror', 'positive', 5)""")
+    assert conn.execute("SELECT dilirank_class, agreement FROM v_faers_vs_dilirank").fetchone() == (
+        "most", "agree")
+
+
+def test_exact_option_matches_whole_names(run, conn):
+    run("--drug", "Troglitazone", "--exact")
+    searches = [c.get("search") for c in run.session.calls]
+    expected = ('(patient.drug.openfda.generic_name.exact:("TROGLITAZONE")'
+                ' OR patient.drug.openfda.substance_name.exact:("TROGLITAZONE"))')
+    assert expected in searches
+
+
+def test_zero_reports_keeps_scoring_choice(run, conn, tmp_path):
+    run()
+    conn.execute("UPDATE reference_outcome SET use_for_scoring = true WHERE source = 'FAERS'")
+    for k in [k for k in run.session.totals if k and "Troglitazone" in k]:
+        del run.session.totals[k]
+    run("--cache", str(tmp_path / "fresh.json"))
+    verdict, scoring, finding = conn.execute(
+        """SELECT r.verdict, r.use_for_scoring, r.finding FROM reference_outcome r
+           JOIN drug d USING (drug_id) WHERE d.name = 'Troglitazone' AND r.source = 'FAERS'""").fetchone()
+    assert (verdict, scoring) == ("ambiguous", True)
+    assert finding.startswith("No FAERS reports found")
+
+
+def test_signal_row_records_cutoff_and_release(run, conn):
+    run("--min-expected", "10")
+    assert conn.execute(
+        "SELECT DISTINCT min_expected, faers_updated FROM faers_signal").fetchall() == [(10, "2026-09-30")]
+
+
+def test_scripts_refuse_an_outdated_schema(conn):
+    from loaders import db
+    conn.execute("COMMENT ON SCHEMA ooc IS NULL")
+    conn.commit()
+    with pytest.raises(SystemExit, match="older schema.sql"):
+        db.check_schema(conn)

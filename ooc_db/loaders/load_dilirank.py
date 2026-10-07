@@ -96,25 +96,34 @@ def resolve_sheet(path: pathlib.Path, sheet: str | None = None) -> str | None:
 
 
 def _read_text_table(path: pathlib.Path) -> pd.DataFrame:
-    """CSV/TXT/TSV as saved by Excel: UTF-8 or Windows encoding, comma,
-    semicolon or tab separated, title rows narrower than the table."""
+    """CSV/TXT/TSV as saved by Excel: UTF-8, UTF-16 ('Unicode Text') or
+    Windows encoding; comma, semicolon or tab separated; any line endings;
+    title rows narrower than the table."""
     data = path.read_bytes()
-    for encoding in ("utf-8-sig", "cp1252"):
-        try:
-            text = data.decode(encoding)
-            break
-        except UnicodeDecodeError:
-            continue
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        text = data.decode("utf-16")
     else:
-        text = data.decode("latin-1")
-    # The delimiter is whichever splits some early line (the header) into the
-    # most columns; title rows above the header may contain none at all.
-    sample = text.splitlines()[:30]
+        for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+            try:
+                text = data.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+
+    def rows_for(delimiter: str) -> list[list[str]]:
+        return list(csv.reader(io.StringIO(text, newline=""), delimiter=delimiter))
+
+    # Use the delimiter that splits the header row into a 'Compound Name'
+    # cell; title rows and quoted names may contain any of them.
     preferred = "\t" if path.suffix.lower() in (".tsv", ".txt") else ","
-    delimiter = max((preferred, ",", ";", "\t"),
-                    key=lambda d: max((len(next(csv.reader([line], delimiter=d), []))
-                                       for line in sample), default=0))
-    rows = list(csv.reader(io.StringIO(text), delimiter=delimiter))
+    rows = None
+    for delimiter in dict.fromkeys((preferred, ",", ";", "\t")):
+        candidate = rows_for(delimiter)
+        if any(_key(cell) == "compoundname" for row in candidate[:20] for cell in row):
+            rows = candidate
+            break
+    if rows is None:
+        rows = rows_for(preferred)
     width = max((len(r) for r in rows), default=0)
     return pd.DataFrame([r + [""] * (width - len(r)) for r in rows], dtype=str)
 
@@ -189,31 +198,33 @@ def parse(path: pathlib.Path, sheet: str | None = None) -> list[Entry]:
     return entries
 
 
+def merge_group(group: list[Entry], less_concern_as: str) -> tuple[Entry, str | None]:
+    """Combine entries for one drug: the most serious category if their
+    verdicts agree, otherwise an ambiguous entry and a warning."""
+    if len(group) == 1:
+        return group[0], None
+    verdicts = {verdict_for(e.category, less_concern_as) for e in group}
+    if len(verdicts) == 1:
+        return min(group, key=lambda e: CATEGORIES.index(e.category)), None
+    first = group[0]
+    listed = "; ".join(f"'{e.name}' {e.raw_category}" for e in group)
+    merged = Entry(first.name, "ambiguous", " / ".join(e.raw_category for e in group),
+                   first.ltkbid, first.severity, first.label_section, first.comment)
+    return merged, f"{listed}: different verdicts for one drug; loaded as ambiguous"
+
+
 def merge_duplicates(entries: list[Entry], less_concern_as: str = "positive"
                      ) -> tuple[list[Entry], list[str]]:
-    """One entry per drug name.
-
-    Duplicates with the same verdict keep the most serious category;
-    duplicates with different verdicts become ambiguous.
-    """
+    """One entry per drug name (see merge_group)."""
     by_name: dict[str, list[Entry]] = {}
     for e in entries:
         by_name.setdefault(e.name.lower(), []).append(e)
-
     merged, warnings = [], []
     for group in by_name.values():
-        verdicts = {verdict_for(e.category, less_concern_as) for e in group}
-        if len(verdicts) > 1:
-            first = group[0]
-            warnings.append(
-                f"{first.name}: listed {len(group)} times with different categories "
-                f"({', '.join(sorted(e.raw_category for e in group))}); loaded as ambiguous"
-            )
-            merged.append(Entry(first.name, "ambiguous",
-                                " / ".join(e.raw_category for e in group), first.ltkbid,
-                                first.severity, first.label_section, first.comment))
-        else:
-            merged.append(min(group, key=lambda e: CATEGORIES.index(e.category)))
+        entry, warning = merge_group(group, less_concern_as)
+        merged.append(entry)
+        if warning:
+            warnings.append(warning)
     return merged, warnings
 
 
@@ -239,12 +250,14 @@ def _finding(e: Entry) -> str:
 
 def load(conn, entries: list[Entry], *, less_concern_as: str = "positive",
          only_existing: bool = False, retrieved_on: dt.date | None = None) -> Counter:
-    """Write one DILIrank reference row per drug and remove DILIrank rows for
-    drugs not in `entries`, so the database matches the file just loaded."""
+    """Write one DILIrank reference row per drug and remove rows this loader
+    wrote earlier for drugs not in `entries`, so the database matches the
+    file just loaded. Hand-typed DILIrank rows are never removed."""
     retrieved_on = retrieved_on or dt.date.today()
     stats: Counter = Counter()
-    loaded: dict[int, tuple[Entry, str]] = {}   # drug_id -> (entry, verdict)
 
+    # Several DILIrank names can be one drug in the database (drug_alias).
+    by_drug: dict[int, list[Entry]] = {}
     for e in entries:
         if only_existing:
             drug_id = db.find_drug(conn, e.name)
@@ -254,24 +267,15 @@ def load(conn, entries: list[Entry], *, less_concern_as: str = "positive",
         else:
             drug_id, created = db.get_or_create_drug(conn, e.name)
             stats["drugs created"] += created
+        by_drug.setdefault(drug_id, []).append(e)
 
-        verdict = verdict_for(e.category, less_concern_as)
-        finding = _finding(e)
-        if drug_id in loaded:
-            # Two DILIrank names for one drug (e.g. via drug_alias).
-            other, other_verdict = loaded[drug_id]
-            if other_verdict == verdict:
-                stats["merged: same drug under two names"] += 1
-                continue
-            print(f"warning: DILIrank lists '{other.name}' ({other.raw_category}) and "
-                  f"'{e.name}' ({e.raw_category}), which are the same drug in the database; "
-                  "loaded as ambiguous", file=sys.stderr)
-            verdict = "ambiguous"
-            finding = f"{other.raw_category} / {e.raw_category}; conflicting DILIrank entries " \
-                      f"'{other.name}' and '{e.name}'"
-            stats["merged: conflicting names for one drug"] += 1
-        loaded[drug_id] = (e, verdict)
-
+    for drug_id, group in by_drug.items():
+        e, warning = merge_group(group, less_concern_as)
+        if len(group) > 1:
+            stats["merged: conflicting names for one drug" if warning
+                  else "merged: same drug under two names"] += 1
+        if warning:
+            print("warning:", warning, file=sys.stderr)
         db.upsert_reference(conn, {
             "drug_id": drug_id,
             "endpoint": "toxicity",
@@ -279,8 +283,8 @@ def load(conn, entries: list[Entry], *, less_concern_as: str = "positive",
             "species": "human",
             "evidence_type": "FDA drug labeling and literature",
             "source": SOURCE,
-            "finding": finding,
-            "verdict": verdict,
+            "finding": _finding(e),
+            "verdict": verdict_for(e.category, less_concern_as),
             "citation": CITATION,
             "use_for_scoring": True,
             "method": "database",
@@ -291,22 +295,28 @@ def load(conn, entries: list[Entry], *, less_concern_as: str = "positive",
 
     removed = conn.execute(
         """DELETE FROM reference_outcome
-           WHERE source = %s AND method = 'database' AND endpoint = 'toxicity'
+           WHERE source = %s AND method = 'database' AND citation = %s AND endpoint = 'toxicity'
              AND organ = 'liver' AND species = 'human' AND NOT (drug_id = ANY(%s))""",
-        (SOURCE, list(loaded)),
+        (SOURCE, CITATION, list(by_drug)),
     ).rowcount
     if removed:
         stats["removed: earlier DILIrank rows for drugs not in this file"] = removed
 
-    hand_typed = conn.execute(
-        "SELECT count(*) FROM reference_outcome WHERE source = %s AND method = 'curated'",
-        (SOURCE,),
-    ).fetchone()[0]
-    if hand_typed:
-        print(f"warning: {hand_typed} hand-entered reference rows have source 'DILIrank' "
-              "(method 'curated'). They are kept alongside the imported rows and may "
-              "duplicate or contradict them; change their method to 'database' or delete them.",
-              file=sys.stderr)
+    duplicates, unmatched = conn.execute(
+        """SELECT count(*) FILTER (WHERE drug_id = ANY(%(ids)s)),
+                  count(*) FILTER (WHERE NOT (drug_id = ANY(%(ids)s)))
+           FROM reference_outcome
+           WHERE source = %(src)s AND citation IS DISTINCT FROM %(cit)s""",
+        {"ids": list(by_drug), "src": SOURCE, "cit": CITATION},
+    ).fetchone()
+    if duplicates:
+        print(f"warning: {duplicates} hand-entered reference rows with source 'DILIrank' sit next "
+              "to the imported rows for the same drugs and may contradict them; delete them "
+              "or set use_for_scoring = false.", file=sys.stderr)
+    if unmatched:
+        print(f"warning: {unmatched} hand-entered reference rows with source 'DILIrank' are for "
+              "drugs this file did not update (perhaps spelled differently). They are kept; "
+              "check them, or add the DILIrank spelling to drug_alias.", file=sys.stderr)
     return stats
 
 

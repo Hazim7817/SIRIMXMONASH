@@ -9,6 +9,8 @@
 
 DROP SCHEMA IF EXISTS ooc CASCADE;
 CREATE SCHEMA ooc;
+-- The loaders check this version; change it with any incompatible change.
+COMMENT ON SCHEMA ooc IS 'ooc_db schema version 3';
 SET search_path TO ooc;
 
 
@@ -17,9 +19,11 @@ SET search_path TO ooc;
 -- ---------------------------------------------------------------------------
 CREATE TABLE drug (
     drug_id        serial PRIMARY KEY,
-    -- No leading/trailing spaces, tabs, line breaks or non-breaking spaces,
-    -- which would make 'Aspirin ' a different drug from 'Aspirin'.
-    name           text NOT NULL CHECK (name = btrim(name, E' \t\r\n ') AND name <> ''),
+    -- Single spaces only: no leading/trailing or doubled spaces, tabs, line
+    -- breaks or non-breaking spaces, which would make 'Aspirin ' a
+    -- different drug from 'Aspirin'.
+    name           text NOT NULL CHECK (name = btrim(name) AND name !~ '[\t\r\n\u00a0]|  '
+                                        AND name <> ''),
     pubchem_cid    integer UNIQUE,          -- use IDs, not names, to match external databases
     inchikey       text UNIQUE,
     human_cmax_um  numeric CHECK (human_cmax_um > 0),  -- peak blood concentration in patients, µM
@@ -34,20 +38,22 @@ CREATE UNIQUE INDEX drug_name_ci ON drug (lower(name));
 CREATE TABLE drug_alias (
     alias_id  serial PRIMARY KEY,
     drug_id   integer NOT NULL REFERENCES drug ON DELETE CASCADE,
-    alias     text NOT NULL CHECK (alias = btrim(alias, E' \t\r\n ') AND alias <> ''),
+    alias     text NOT NULL CHECK (alias = btrim(alias) AND alias !~ '[\t\r\n\u00a0]|  '
+                                   AND alias <> ''),
     source    text                          -- where the alias came from
 );
 CREATE UNIQUE INDEX drug_alias_ci ON drug_alias (lower(alias));
 
 -- A name must not be one drug's name and another drug's alias, or lookups
 -- by name would be ambiguous.
-CREATE FUNCTION check_name_alias_clash() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE FUNCTION check_name_alias_clash() RETURNS trigger LANGUAGE plpgsql
+SET search_path = ooc, pg_catalog AS $$
 BEGIN
     IF TG_TABLE_NAME = 'drug_alias' THEN
-        IF EXISTS (SELECT 1 FROM drug WHERE lower(name) = lower(NEW.alias) AND drug_id <> NEW.drug_id) THEN
+        IF EXISTS (SELECT 1 FROM ooc.drug WHERE lower(name) = lower(NEW.alias) AND drug_id <> NEW.drug_id) THEN
             RAISE EXCEPTION 'alias "%" is already the name of another drug; merge the two drugs instead', NEW.alias;
         END IF;
-    ELSIF EXISTS (SELECT 1 FROM drug_alias WHERE lower(alias) = lower(NEW.name) AND drug_id <> NEW.drug_id) THEN
+    ELSIF EXISTS (SELECT 1 FROM ooc.drug_alias WHERE lower(alias) = lower(NEW.name) AND drug_id <> NEW.drug_id) THEN
         RAISE EXCEPTION 'name "%" is already an alias of another drug', NEW.name;
     END IF;
     RETURN NEW;
@@ -218,8 +224,10 @@ CREATE TABLE faers_signal (
     is_signal         boolean NOT NULL,
     criteria          text NOT NULL,         -- rule used for is_signal
     -- positive = signal; negative = reported no more often than expected,
-    -- with enough data to have seen an excess; ambiguous = neither
+    -- with at least min_expected reports expected; ambiguous = neither
     verdict           text NOT NULL CHECK (verdict IN ('positive', 'negative', 'ambiguous')),
+    min_expected      numeric NOT NULL,      -- cut-off used for the verdict
+    faers_updated     text,                  -- openFDA data release (meta.last_updated)
     queried_on        date NOT NULL DEFAULT current_date,
     UNIQUE (drug_id, event_definition)
 );
@@ -283,17 +291,31 @@ SELECT drug_id, endpoint, organ, species,
                THEN min(verdict) FILTER (WHERE verdict <> 'ambiguous')
            ELSE 'conflicting'
        END AS verdict,
-       string_agg(DISTINCT source, ', ') AS sources,
-       count(*) AS n_findings
+       CASE WHEN count(*) FILTER (WHERE verdict <> 'ambiguous') > 0
+            THEN string_agg(DISTINCT source, ', ') FILTER (WHERE verdict <> 'ambiguous')
+            ELSE string_agg(DISTINCT source, ', ')
+       END AS sources,
+       CASE WHEN count(*) FILTER (WHERE verdict <> 'ambiguous') > 0
+            THEN count(*) FILTER (WHERE verdict <> 'ambiguous')
+            ELSE count(*)
+       END AS n_findings
 FROM reference_outcome
 WHERE use_for_scoring
 GROUP BY drug_id, endpoint, organ, species;
 
 
--- The chip's answer next to the known answer, drug by drug. A chip call with
--- no reference at all for its organ appears once with outcome 'no reference'.
+-- The chip's answer next to the known answer, drug by drug, for every
+-- species that has scored references for that organ (and always for
+-- human). A drug missing a reference for a species appears with outcome
+-- 'no reference' on that species' row.
 CREATE VIEW v_concordance AS
-SELECT d.name AS drug, cm.name AS chip_model, cc.endpoint, rc.species,
+WITH scored_species AS (
+    SELECT DISTINCT endpoint, organ, species FROM reference_outcome WHERE use_for_scoring
+    UNION
+    SELECT e.endpoint, cm.organ, 'human'
+    FROM (VALUES ('toxicity'), ('efficacy')) AS e(endpoint) CROSS JOIN chip_model cm
+)
+SELECT d.name AS drug, cm.name AS chip_model, cc.endpoint, sp.species,
        cc.verdict AS chip_says, rc.verdict AS reference_says, rc.sources,
        CASE
            WHEN rc.verdict IS NULL THEN 'no reference'
@@ -306,8 +328,10 @@ SELECT d.name AS drug, cm.name AS chip_model, cc.endpoint, rc.species,
 FROM chip_call cc
 JOIN drug d USING (drug_id)
 JOIN chip_model cm USING (chip_model_id)
+JOIN scored_species sp ON sp.endpoint = cc.endpoint AND sp.organ = cm.organ
 LEFT JOIN v_reference_consensus rc
-     ON rc.drug_id = cc.drug_id AND rc.endpoint = cc.endpoint AND rc.organ = cm.organ;
+     ON rc.drug_id = cc.drug_id AND rc.endpoint = cc.endpoint AND rc.organ = cm.organ
+    AND rc.species = sp.species;
 
 
 -- The headline numbers: how well does each chip model predict each species?
@@ -337,13 +361,15 @@ GROUP BY chip_model, endpoint, species;
 
 -- How well do FAERS signals agree with DILIrank? A sanity check on the
 -- statistical signals before you rely on them for drugs DILIrank lacks.
--- Drugs with too few FAERS reports to call either way ('ambiguous') and
--- Ambiguous DILIrank drugs are 'not compared'. dilirank_class lets you
--- compare Most-DILI-concern vs No-DILI-concern only, as published
--- benchmarks do.
+-- Compares signal / no signal with DILIrank's verdict, as published
+-- benchmarks do. Drugs without a signal that had fewer than min_expected
+-- event reports expected are 'too few reports' (FAERS could not have shown
+-- a signal); Ambiguous DILIrank drugs are 'not compared'. dilirank_class
+-- lets you compare Most-DILI-concern vs No-DILI-concern only. Imported
+-- DILIrank rows are used, or a hand-typed one if there is no imported row.
 CREATE VIEW v_faers_vs_dilirank AS
 WITH dilirank AS (
-    SELECT drug_id, verdict, finding,
+    SELECT DISTINCT ON (drug_id) drug_id, verdict, finding,
            CASE regexp_replace(lower(split_part(finding, ';', 1)), '[^a-z/]', '', 'g')
                WHEN 'vmostdiliconcern' THEN 'most'
                WHEN 'mostdiliconcern' THEN 'most'
@@ -353,11 +379,11 @@ WITH dilirank AS (
                WHEN 'nodiliconcern' THEN 'no'
                WHEN 'ambiguousdiliconcern' THEN 'ambiguous'
                WHEN 'vambiguousdiliconcern' THEN 'ambiguous'
-               ELSE 'other'                  -- e.g. conflicting duplicates, hand-typed rows
+               ELSE 'other'                  -- e.g. conflicting duplicates
            END AS dilirank_class
     FROM reference_outcome
-    WHERE source = 'DILIrank' AND endpoint = 'toxicity' AND organ = 'liver'
-      AND species = 'human' AND method = 'database'
+    WHERE source = 'DILIrank' AND endpoint = 'toxicity' AND organ = 'liver' AND species = 'human'
+    ORDER BY drug_id, (method = 'database') DESC, reference_id
 )
 SELECT d.name AS drug, fs.event_definition, fs.a AS n_reports_with_event,
        round(fs.expected_a, 1) AS expected_reports,
@@ -365,11 +391,12 @@ SELECT d.name AS drug, fs.event_definition, fs.a AS n_reports_with_event,
        round(fs.prr, 2) AS prr, fs.is_signal AS faers_signal, fs.verdict AS faers_verdict,
        dr.verdict AS dilirank_verdict, dr.dilirank_class, dr.finding AS dilirank_category,
        CASE
-           WHEN dr.verdict IS NULL OR dr.verdict = 'ambiguous' OR fs.verdict = 'ambiguous'
-               THEN 'not compared'
-           WHEN fs.verdict = dr.verdict THEN 'agree'
+           WHEN dr.verdict IS NULL OR dr.verdict = 'ambiguous' THEN 'not compared'
+           WHEN NOT fs.is_signal AND fs.expected_a < fs.min_expected THEN 'too few reports'
+           WHEN fs.is_signal = (dr.verdict = 'positive') THEN 'agree'
            ELSE 'disagree'
-       END AS agreement
+       END AS agreement,
+       fs.drug_query
 FROM faers_signal fs
 JOIN drug d USING (drug_id)
 LEFT JOIN dilirank dr USING (drug_id);

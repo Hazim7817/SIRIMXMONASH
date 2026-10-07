@@ -8,6 +8,7 @@ import sys
 import psycopg
 
 DSN_ENV = "OOC_DATABASE_URL"
+SCHEMA_VERSION = "ooc_db schema version 3"   # must match COMMENT ON SCHEMA in schema.sql
 
 
 def connect(dsn: str | None = None) -> psycopg.Connection:
@@ -21,12 +22,27 @@ def connect(dsn: str | None = None) -> psycopg.Connection:
         sys.exit(
             f"No database given. Pass --dsn or set {DSN_ENV}, e.g.\n"
             "  postgresql://postgres:YOUR_PASSWORD@localhost:5432/ooc\n"
-            "or, if the password contains @ : / # or spaces,\n"
-            "  host=localhost port=5432 dbname=ooc user=postgres password=YOUR_PASSWORD"
+            "or, if the password contains @ : / # ? % or spaces,\n"
+            "  host=localhost port=5432 dbname=ooc user=postgres password='YOUR PASSWORD'\n"
+            "(inside the quotes, write \\' for a quote and \\\\ for a backslash)"
         )
     conn = psycopg.connect(dsn)
+    check_schema(conn)
     conn.execute("SET search_path TO ooc")
     return conn
+
+
+def check_schema(conn: psycopg.Connection) -> None:
+    """Stop with a clear message if schema.sql was not run, or is outdated."""
+    version = conn.execute(
+        """SELECT obj_description(oid, 'pg_namespace') FROM pg_namespace WHERE nspname = 'ooc'"""
+    ).fetchone()
+    if version is None:
+        sys.exit("This database has no 'ooc' schema yet. Run schema.sql in it first "
+                 "(pgAdmin: Query Tool -> open schema.sql -> Run).")
+    if version[0] != SCHEMA_VERSION:
+        sys.exit(f"This database was created with an older schema.sql ({version[0] or 'version 1'}); "
+                 f"these scripts need '{SCHEMA_VERSION}'. See 'Upgrading' in README.md.")
 
 
 def normalize_name(name: str) -> str:
