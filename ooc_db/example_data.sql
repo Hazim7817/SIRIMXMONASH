@@ -39,12 +39,14 @@ FROM (VALUES
 JOIN experiment e ON e.code = v.code
 JOIN readout r ON r.name = v.readout;
 
-INSERT INTO reference_outcome (drug_id, endpoint, organ, species, evidence_type, source, finding, verdict, citation) VALUES
-    ((SELECT drug_id FROM drug WHERE name = 'Acetaminophen'), 'toxicity', 'liver', 'human', 'post-market', 'LiverTox', 'Hepatotoxicity in overdose', 'positive', 'Verify in LiverTox'),
-    ((SELECT drug_id FROM drug WHERE name = 'Acetaminophen'), 'toxicity', 'liver', 'rat',   'GLP study',   'literature', 'Hepatic necrosis at high dose', 'positive', 'Verify'),
-    ((SELECT drug_id FROM drug WHERE name = 'Troglitazone'),  'toxicity', 'liver', 'human', 'post-market', 'DILIrank', 'Most-DILI-concern; withdrawn', 'positive', 'Verify in DILIrank'),
-    ((SELECT drug_id FROM drug WHERE name = 'Troglitazone'),  'toxicity', 'liver', 'rat',   'GLP study',   'literature', 'No clear liver injury in preclinical studies', 'negative', 'Verify'),
-    ((SELECT drug_id FROM drug WHERE name = 'Buspirone'),     'toxicity', 'liver', 'human', 'post-market', 'DILIrank', 'No-DILI-concern', 'negative', 'Verify in DILIrank');
+-- The DILIrank rows use method 'database', as if imported, so running the
+-- DILIrank loader later updates them instead of adding a second DILIrank row.
+INSERT INTO reference_outcome (drug_id, endpoint, organ, species, evidence_type, source, finding, verdict, citation, method) VALUES
+    ((SELECT drug_id FROM drug WHERE name = 'Acetaminophen'), 'toxicity', 'liver', 'human', 'post-market', 'LiverTox', 'Hepatotoxicity in overdose', 'positive', 'Verify in LiverTox', 'curated'),
+    ((SELECT drug_id FROM drug WHERE name = 'Acetaminophen'), 'toxicity', 'liver', 'rat',   'GLP study',   'literature', 'Hepatic necrosis at high dose', 'positive', 'Verify', 'curated'),
+    ((SELECT drug_id FROM drug WHERE name = 'Troglitazone'),  'toxicity', 'liver', 'human', 'post-market', 'DILIrank', 'vMost-DILI-concern; withdrawn', 'positive', 'Verify in DILIrank', 'database'),
+    ((SELECT drug_id FROM drug WHERE name = 'Troglitazone'),  'toxicity', 'liver', 'rat',   'GLP study',   'literature', 'No clear liver injury in preclinical studies', 'negative', 'Verify', 'curated'),
+    ((SELECT drug_id FROM drug WHERE name = 'Buspirone'),     'toxicity', 'liver', 'human', 'post-market', 'DILIrank', 'vNo-DILI-concern', 'negative', 'Verify in DILIrank', 'database');
 
 INSERT INTO chip_call (drug_id, chip_model_id, endpoint, verdict, max_tested_conc_um, basis) VALUES
     ((SELECT drug_id FROM drug WHERE name = 'Acetaminophen'), 1, 'toxicity', 'positive', 3475, 'ALT >= 2x control at <= 25x Cmax'),

@@ -72,3 +72,52 @@ def test_release_change_mid_run_is_an_error():
     s.last_updated = "2026-10-07"
     with pytest.raises(OpenFDAError, match="updated during the run"):
         c.count("x")
+
+
+# --- review regressions --------------------------------------------------------
+
+def test_corrupt_cache_is_ignored_with_a_warning(tmp_path, capsys):
+    cache = tmp_path / "cache.json"
+    for content in ("", '{"last_updated": "2026-09-30", "counts": {"x": 7', "[1, 2]"):
+        cache.write_text(content)
+        c = client(FakeSession({None: 100, "x": 5}), cache_path=cache)
+        assert c.count("x") == 5
+        assert "ignoring unreadable cache" in capsys.readouterr().err
+        assert json.loads(cache.read_text())["counts"]["x"] == 5
+
+
+def test_cache_write_leaves_no_temporary_file(tmp_path):
+    cache = tmp_path / "cache.json"
+    client(FakeSession({None: 100, "x": 5}), cache_path=cache).count("x")
+    assert [p.name for p in tmp_path.iterdir()] == ["cache.json"]
+
+
+class Garbled200(FakeSession):
+    def get(self, url, params, timeout):
+        from fake_openfda import Response
+        self.calls.append(dict(params))
+        return Response(200, None)  # e.g. an HTML maintenance page
+
+
+def test_unexpected_200_body_is_retried_then_reported():
+    s = Garbled200({})
+    with pytest.raises(OpenFDAError, match="unexpected response"):
+        client(s, max_retries=2).count(None)
+    assert len(s.calls) == 3
+
+
+def test_api_key_is_redacted_from_errors():
+    import requests
+
+    class Down(FakeSession):
+        def get(self, url, params, timeout):
+            raise requests.ConnectionError(f"Max retries exceeded with url: /drug/event.json?api_key={params['api_key']}")
+
+    with pytest.raises(OpenFDAError) as e:
+        client(Down({}), api_key="SECRET/KEY+1", max_retries=0).count(None)
+    assert "SECRET" not in str(e.value) and "***" in str(e.value)
+
+    s = FakeSession({}, failures=[403])
+    with pytest.raises(OpenFDAError) as e:
+        client(s, api_key="SECRETKEY").count(None)
+    assert "SECRETKEY" not in str(e.value)

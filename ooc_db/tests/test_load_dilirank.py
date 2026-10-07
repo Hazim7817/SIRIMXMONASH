@@ -212,3 +212,84 @@ def test_main_dry_run(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "Read 2 drugs" in out and "sheet 'version 2'" in out
     assert "1 no, 1 ambiguous" in out
+
+
+# --- review regressions --------------------------------------------------------
+
+def test_windows_csv_with_title_row_semicolons_and_cp1252(tmp_path):
+    path = tmp_path / "dilirank.csv"
+    text = ("DILIrank dataset | FDA\r\n"
+            "LTKBID;Compound Name;Severity Class;Label Section;vDILIConcern\r\n"
+            "LT1;Riboflavin 5'-phosphate;0;No match;vNo-DILI-Concern\r\n"
+            "LT2;Café drug;8;Box warning;vMost-DILI-Concern\r\n")
+    path.write_bytes(text.encode("cp1252"))
+    assert [(e.name, e.category) for e in ld.parse(path)] == [
+        ("Riboflavin 5'-phosphate", "no"), ("Café drug", "most")]
+
+
+def test_tab_delimited_txt(tmp_path):
+    path = tmp_path / "dilirank.txt"
+    path.write_text("Compound Name\tvDILIConcern\nacetaminophen\tvMost-DILI-Concern\n")
+    assert [(e.name, e.category) for e in ld.parse(path)] == [("acetaminophen", "most")]
+
+
+def test_duplicates_with_the_same_verdict_keep_the_most_serious_category():
+    entries = [ld.Entry("Drug A", "less", "vLess-DILI-Concern"),
+               ld.Entry("drug a", "most", "vMost-DILI-Concern")]
+    merged, warnings = ld.merge_duplicates(entries)
+    assert [(e.name, e.category) for e in merged] == [("drug a", "most")] and warnings == []
+    # ...but they conflict when Less-DILI-concern is not counted as positive
+    merged, warnings = ld.merge_duplicates(entries, "ambiguous")
+    assert merged[0].category == "ambiguous" and len(warnings) == 1
+
+
+def test_two_names_for_one_drug_via_alias(conn, capsys):
+    drug_id = conn.execute("INSERT INTO drug (name) VALUES ('Diclofenac') RETURNING drug_id").fetchone()[0]
+    conn.execute("INSERT INTO drug_alias (drug_id, alias) VALUES (%s, 'Diclofenac sodium')", (drug_id,))
+    conflicting = [ld.Entry("Diclofenac", "most", "vMost-DILI-concern", "LT1"),
+                   ld.Entry("Diclofenac sodium", "no", "vNo-DILI-concern", "LT2")]
+    stats = ld.load(conn, conflicting)
+    assert "same drug in the database" in capsys.readouterr().err
+    assert stats["merged: conflicting names for one drug"] == 1
+    assert _refs(conn) == [("Diclofenac", "ambiguous", "LT2", True)]
+
+    agreeing = [ld.Entry("Diclofenac", "most", "vMost-DILI-concern", "LT1"),
+                ld.Entry("Diclofenac sodium", "most", "vMost-DILI-concern", "LT2")]
+    stats = ld.load(conn, agreeing)
+    assert stats["merged: same drug under two names"] == 1
+    assert _refs(conn) == [("Diclofenac", "positive", "LT1", True)]
+
+
+def test_loading_a_smaller_list_removes_drugs_not_in_it(conn, tmp_path):
+    path = tmp_path / "book.xlsx"
+    _two_sheet_workbook(path)
+    ld.load(conn, ld.parse(path))                      # version 2: Atracurium, Polidocanol
+    stats = ld.load(conn, ld.parse(path, "version 1"))  # version 1: Atracurium only
+    assert stats["removed: earlier DILIrank rows for drugs not in this file"] == 1
+    assert [r[0] for r in _refs(conn)] == ["Atracurium"]
+    assert conn.execute("SELECT count(*) FROM drug WHERE name = 'Polidocanol'").fetchone()[0] == 1
+
+
+def test_hand_entered_dilirank_rows_are_flagged(conn, capsys):
+    drug_id = conn.execute("INSERT INTO drug (name) VALUES ('Buspirone') RETURNING drug_id").fetchone()[0]
+    conn.execute("""INSERT INTO reference_outcome (drug_id, endpoint, organ, species, source, verdict)
+                    VALUES (%s, 'toxicity', 'liver', 'human', 'DILIrank', 'negative')""", (drug_id,))
+    ld.load(conn, [ld.Entry("Buspirone", "no", "vNo-DILI-concern")])
+    assert "hand-entered reference rows" in capsys.readouterr().err
+
+
+def test_download_failure_gives_advice(monkeypatch):
+    import requests
+
+    def fail(*a, **kw):
+        raise requests.ConnectionError("no route to host")
+    monkeypatch.setattr(requests, "get", fail)
+    with pytest.raises(SystemExit) as e:
+        ld.download()
+    assert "use --file instead" in str(e.value)
+
+
+def test_name_whitespace_is_normalised(conn):
+    entries = [ld.Entry("Aminosalicylic  acid", "less", "vLess-DILI-concern")]
+    ld.load(conn, entries)
+    assert conn.execute("SELECT name FROM drug").fetchall() == [("Aminosalicylic acid",)]

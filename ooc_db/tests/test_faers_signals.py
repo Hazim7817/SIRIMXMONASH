@@ -79,7 +79,7 @@ TOTALS = {
 
 @pytest.fixture
 def run(conn, tmp_path, monkeypatch, capsys):
-    session = FakeSession(TOTALS)
+    session = FakeSession(dict(TOTALS))  # a copy: tests may change it
     monkeypatch.setattr(fs, "OpenFDA", lambda api_key, cache_path: OpenFDA(
         api_key=api_key, cache_path=cache_path, session=session, sleep=lambda s: None, min_interval=0))
     monkeypatch.setattr(fs.db, "connect", lambda dsn: contextlib.nullcontext(conn))
@@ -167,3 +167,94 @@ def test_compare_with_dilirank_view(run, conn, tmp_path):
     run("--source", "DILIrank")
     view = dict(conn.execute("SELECT drug, agreement FROM v_faers_vs_dilirank"))
     assert view == {"Troglitazone": "agree", "buspirone": "disagree"}
+
+
+# --- review regressions --------------------------------------------------------
+
+from loaders.disproportionality import Table2x2, compute, is_signal
+
+
+def _res(a, b, c, d, criterion="ror"):
+    t = Table2x2(a, b, c, d)
+    s = compute(t)
+    return fs.DrugResult(1, "x", ["x"], table=t, stats=s, signal=is_signal(t, s, criterion))
+
+
+@pytest.mark.parametrize("cells, criterion, expected", [
+    ((3, 97, 120_000, 9_879_900), "ror", "ambiguous"),        # ROR 2.5 (CI 0.8-8.0), 1.2 expected
+    ((2, 148, 99_998, 19_899_852), "ror", "ambiguous"),       # elevated, a < 3: not a signal, not safe
+    ((0, 120, 100_000, 19_899_880), "ror", "ambiguous"),      # only 0.6 reports expected
+    ((190, 9_810, 120_000, 9_870_000), "evans", "ambiguous"), # significant excess but PRR < 2
+    ((50, 19_950, 29_950, 9_950_050), "ror", "negative"),     # 50 seen, 60 expected
+    ((400, 4_600, 29_600, 9_965_400), "ror", "positive"),
+])
+def test_verdict_needs_enough_expected_reports(cells, criterion, expected):
+    assert fs.verdict(_res(*cells, criterion), min_expected=5) == expected
+
+
+@pytest.mark.parametrize("name", ["Silver nitrate", "Zinc acetate", "Gallium nitrate",
+                                  "Ammonium lactate", "Ferrous sulfate", "Lithium citrate"])
+def test_base_name_never_returns_a_bare_element(name):
+    assert fs.base_name(name) is None
+
+
+def test_help_works(capsys):
+    with pytest.raises(SystemExit) as e:
+        fs.main(["--help"])
+    assert e.value.code == 0
+    assert "95%" in capsys.readouterr().out
+
+
+def test_stale_results_removed_when_drug_has_no_reports(run, conn, tmp_path):
+    run()
+    assert conn.execute("SELECT count(*) FROM faers_signal").fetchone()[0] == 3
+    for k in [k for k in run.session.totals if k and "Troglitazone" in k]:
+        del run.session.totals[k]
+    out = run("--cache", str(tmp_path / "fresh.json"))  # later option wins: no cached counts
+    assert "Troglitazone: no FAERS reports found" in out.out
+    left = {r[0] for r in conn.execute(
+        "SELECT d.name FROM faers_signal JOIN drug d USING (drug_id)")}
+    assert left == {"buspirone", "rarely used"}
+    assert conn.execute(
+        """SELECT count(*) FROM reference_outcome r JOIN drug d USING (drug_id)
+           WHERE d.name = 'Troglitazone' AND r.source = 'FAERS'""").fetchone()[0] == 0
+
+
+def test_signal_row_records_query_expected_count_and_verdict(run, conn):
+    run()
+    q, expected, verdict = conn.execute(
+        """SELECT drug_query, expected_a, verdict FROM faers_signal JOIN drug d USING (drug_id)
+           WHERE d.name = 'buspirone'""").fetchone()
+    assert q == drug("buspirone")
+    assert float(expected) == pytest.approx(20_000 * 30_000 / 10_000_000)
+    assert verdict == "negative"
+
+
+def test_unknown_term_file_is_announced(conn, tmp_path, monkeypatch, capsys):
+    terms = tmp_path / "my_terms.txt"
+    terms.write_text("HEPATOTOXICITY\n")
+    session = FakeSession({None: 1_000})
+    monkeypatch.setattr(fs, "OpenFDA", lambda api_key, cache_path: OpenFDA(
+        api_key=api_key, cache_path=cache_path, session=session, sleep=lambda s: None, min_interval=0))
+    monkeypatch.setattr(fs.db, "connect", lambda dsn: contextlib.nullcontext(conn))
+    conn.execute("INSERT INTO drug (name) VALUES ('x')")
+    fs.main(["--terms", str(terms), "--cache", str(tmp_path / "c.json")])
+    assert "faers_signal only" in capsys.readouterr().err
+
+
+def test_view_does_not_compare_underpowered_drugs(run, conn, tmp_path):
+    import pandas as pd
+    path = tmp_path / "d.csv"
+    pd.DataFrame([["Compound Name", "vDILIConcern"],
+                  ["Troglitazone", "vMost-DILI-Concern"],
+                  ["buspirone", "vLess-DILI-Concern"],
+                  ["rarely used", "vNo-DILI-Concern"]]).to_csv(path, header=False, index=False)
+    ld.load(conn, ld.parse(path))
+    run("--source", "DILIrank")
+    view = {r[0]: r[1:] for r in conn.execute(
+        "SELECT drug, faers_verdict, dilirank_class, agreement FROM v_faers_vs_dilirank")}
+    assert view == {
+        "Troglitazone": ("positive", "most", "agree"),
+        "buspirone": ("negative", "less", "disagree"),
+        "rarely used": ("ambiguous", "no", "not compared"),  # 40 reports: too few to call
+    }

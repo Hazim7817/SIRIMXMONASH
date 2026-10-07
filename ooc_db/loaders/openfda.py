@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
+import sys
 import time
 
 import requests
@@ -77,7 +79,14 @@ class OpenFDA:
         total = self._live_count(None)
         cached = {}
         if self.cache_path and self.cache_path.exists():
-            cached = json.loads(self.cache_path.read_text())
+            try:
+                cached = json.loads(self.cache_path.read_text())
+                if not isinstance(cached, dict):
+                    raise ValueError("not a JSON object")
+            except (ValueError, OSError) as e:
+                print(f"warning: ignoring unreadable cache {self.cache_path} ({e}); "
+                      "counts will be fetched again", file=sys.stderr)
+                cached = {}
         if cached.get("last_updated") == self.last_updated:
             self.counts = {**cached.get("counts", {}), "<all>": total}
         else:
@@ -85,9 +94,13 @@ class OpenFDA:
         self._save()
 
     def _save(self) -> None:
+        """Write the cache to a temporary file, then swap it in, so an
+        interruption never leaves a half-written cache."""
         if self.cache_path:
-            self.cache_path.write_text(json.dumps(
+            tmp = self.cache_path.with_name(self.cache_path.name + ".tmp")
+            tmp.write_text(json.dumps(
                 {"last_updated": self.last_updated, "counts": self.counts}, indent=0, sort_keys=True))
+            os.replace(tmp, self.cache_path)
 
     def _live_count(self, search: str | None) -> int:
         params = {"limit": 1}
@@ -116,22 +129,34 @@ class OpenFDA:
             try:
                 r = self.session.get(BASE_URL, params=params, timeout=self.timeout)
             except requests.RequestException as e:
-                error = f"network error: {e}"
+                error = self._redact(f"network error: {e}")
             else:
                 if r.status_code == 200:
-                    meta = r.json()["meta"]
-                    return int(meta["results"]["total"]), meta.get("last_updated")
-                body = _json_or_none(r)
-                code = ((body or {}).get("error") or {}).get("code")
-                if r.status_code == 404 and code == "NOT_FOUND":
-                    return 0, None  # openFDA's answer to a search with no matches
-                error = f"HTTP {r.status_code}: {(body or {}).get('error') or r.text[:300]}"
-                if r.status_code not in (429, 500, 502, 503, 504):
-                    raise OpenFDAError(f"{error} (search: {params.get('search')})")
+                    try:
+                        meta = r.json()["meta"]
+                        return int(meta["results"]["total"]), meta.get("last_updated")
+                    except (ValueError, KeyError, TypeError) as e:
+                        error = f"unexpected response from openFDA ({e!r}): {r.text[:300]}"
+                else:
+                    body = _json_or_none(r)
+                    err = body.get("error") if isinstance(body, dict) else None
+                    code = err.get("code") if isinstance(err, dict) else None
+                    if r.status_code == 404 and code == "NOT_FOUND":
+                        return 0, None  # openFDA's answer to a search with no matches
+                    error = self._redact(f"HTTP {r.status_code}: {err or r.text[:300]}")
+                    if r.status_code not in (429, 500, 502, 503, 504):
+                        raise OpenFDAError(f"{error} (search: {params.get('search')})")
             if attempt < self.max_retries:
                 self.sleep(delay)
                 delay *= 2
         raise OpenFDAError(f"{error} after {self.max_retries + 1} attempts (search: {params.get('search')})")
+
+    def _redact(self, text: str) -> str:
+        """Hide the API key, which appears in URLs inside error messages."""
+        if self.api_key:
+            for form in (self.api_key, requests.utils.quote(self.api_key, safe="")):
+                text = text.replace(form, "***")
+        return text
 
 
 def _json_or_none(r: requests.Response):

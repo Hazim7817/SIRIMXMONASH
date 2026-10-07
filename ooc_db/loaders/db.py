@@ -20,26 +20,36 @@ def connect(dsn: str | None = None) -> psycopg.Connection:
     if not dsn:
         sys.exit(
             f"No database given. Pass --dsn or set {DSN_ENV}, e.g.\n"
-            "  postgresql://postgres:YOUR_PASSWORD@localhost:5432/ooc"
+            "  postgresql://postgres:YOUR_PASSWORD@localhost:5432/ooc\n"
+            "or, if the password contains @ : / # or spaces,\n"
+            "  host=localhost port=5432 dbname=ooc user=postgres password=YOUR_PASSWORD"
         )
     conn = psycopg.connect(dsn)
     conn.execute("SET search_path TO ooc")
     return conn
 
 
+def normalize_name(name: str) -> str:
+    """Collapse runs of whitespace (including non-breaking spaces) to one space."""
+    return " ".join(name.split())
+
+
 def find_drug(conn: psycopg.Connection, name: str) -> int | None:
-    """Drug ID for a name or alias, ignoring case; None if unknown."""
+    """Drug ID for a name or alias, ignoring case; None if unknown.
+
+    A drug's own name wins over another drug's alias.
+    """
     row = conn.execute(
         """
-        SELECT drug_id FROM drug WHERE lower(name) = lower(%(n)s)
-        UNION
-        SELECT drug_id FROM drug_alias WHERE lower(alias) = lower(%(n)s)
+        SELECT drug_id, 1 AS priority FROM drug WHERE lower(name) = lower(%(n)s)
+        UNION ALL
+        SELECT drug_id, 2 FROM drug_alias WHERE lower(alias) = lower(%(n)s)
+        ORDER BY priority
+        LIMIT 1
         """,
-        {"n": name.strip()},
-    ).fetchall()
-    if len(row) > 1:
-        raise ValueError(f"{name!r} matches more than one drug (check drug_alias)")
-    return row[0][0] if row else None
+        {"n": normalize_name(name)},
+    ).fetchone()
+    return row[0] if row else None
 
 
 def get_or_create_drug(conn: psycopg.Connection, name: str, notes: str | None = None) -> tuple[int, bool]:
@@ -49,7 +59,7 @@ def get_or_create_drug(conn: psycopg.Connection, name: str, notes: str | None = 
         return drug_id, False
     drug_id = conn.execute(
         "INSERT INTO drug (name, notes) VALUES (%s, %s) RETURNING drug_id",
-        (name.strip(), notes),
+        (normalize_name(name), notes),
     ).fetchone()[0]
     return drug_id, True
 

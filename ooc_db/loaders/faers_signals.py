@@ -63,6 +63,14 @@ SALT_WORDS = {
     "phosphate", "potassium", "sodium", "succinate", "sulfate", "sulphate", "tartrate",
     "tosylate", "trihydrate",
 }
+# Elements and inorganic ions: a bare one would match unrelated products
+# ('Silver nitrate' -> 'Silver' would match silver sulfadiazine).
+BARE_ELEMENTS = {
+    "aluminum", "aluminium", "ammonium", "barium", "bismuth", "cadmium", "cesium", "chromic",
+    "cobalt", "copper", "cupric", "ferric", "ferrous", "gallium", "gold", "iron", "lithium",
+    "manganese", "mercuric", "mercurous", "silver", "stannous", "strontium", "thallium",
+    "thallous", "zinc",
+}
 
 
 def read_terms(path: pathlib.Path) -> list[str]:
@@ -83,6 +91,7 @@ class DrugResult:
     drug_id: int
     name: str
     query_names: list[str]
+    drug_query: str = ""
     table: Table2x2 | None = None
     stats: Stats | None = None
     signal: bool | None = None
@@ -110,13 +119,13 @@ def select_drugs(conn, names: list[str] | None, source: str | None) -> list[tupl
 def base_name(name: str) -> str | None:
     """Name without trailing salt/hydrate words, or None if nothing to strip.
 
-    Never reduces a name to a bare salt ('Potassium chloride' stays as is),
-    which would match thousands of unrelated products.
+    Never reduces a name to a bare salt or element ('Potassium chloride',
+    'Silver nitrate' stay as they are), which would match unrelated products.
     """
     words = name.split()
     while len(words) > 1 and words[-1].lower().strip(",") in SALT_WORDS:
         words.pop()
-    if len(words) == len(name.split()) or words[-1].lower() in SALT_WORDS:
+    if len(words) == len(name.split()) or words[-1].lower() in SALT_WORDS | BARE_ELEMENTS:
         return None
     return " ".join(words)
 
@@ -147,8 +156,8 @@ def check_terms(client: OpenFDA, terms: list[str]) -> list[str]:
 def analyse(client: OpenFDA, drug_id: int, name: str, query_names: list[str], *,
             drug_fields: list[str], event_search: str, n_total: int, n_event: int,
             criterion: str) -> DrugResult:
-    res = DrugResult(drug_id, name, query_names)
     drug_search = drug_clause(drug_fields, query_names)
+    res = DrugResult(drug_id, name, query_names, drug_query=drug_search)
     n_drug = client.count(drug_search)
     if n_drug == 0:
         res.note = "no FAERS reports found under this name"
@@ -160,36 +169,64 @@ def analyse(client: OpenFDA, drug_id: int, name: str, query_names: list[str], *,
     return res
 
 
-def verdict(res: DrugResult, min_drug_reports: int) -> str:
-    """positive = signal; negative = no signal despite enough reports."""
+def expected_events(t: Table2x2) -> float:
+    """Drug-event reports expected if the drug had the background event rate."""
+    return (t.a + t.b) * (t.a + t.c) / t.n
+
+
+def verdict(res: DrugResult, min_expected: float) -> str:
+    """positive = signal.
+
+    negative = the event was reported no more often than expected, and at
+    least `min_expected` reports were expected, so an excess could have been
+    seen. A drug with few reports is 'ambiguous': no signal is not evidence
+    of safety when there was too little data to detect one.
+    """
     if res.signal:
         return "positive"
-    if res.table.a + res.table.b >= min_drug_reports:
+    expected = expected_events(res.table)
+    if expected >= min_expected and res.table.a <= expected:
         return "negative"
     return "ambiguous"
 
 
+def clear(conn, drug_id: int, event_definition: str) -> None:
+    """Remove earlier results for a drug that no longer returns any reports."""
+    conn.execute("DELETE FROM faers_signal WHERE drug_id = %s AND event_definition = %s",
+                 (drug_id, event_definition))
+    if event_definition in EVENT_SCOPE:
+        endpoint, organ, source = EVENT_SCOPE[event_definition]
+        conn.execute(
+            """DELETE FROM reference_outcome
+               WHERE drug_id = %s AND source = %s AND endpoint = %s AND organ = %s
+                 AND species = 'human' AND method = 'statistical_signal'""",
+            (drug_id, source, endpoint, organ))
+
+
 def save(conn, res: DrugResult, *, event_definition: str, terms: list[str], criterion: str,
-         min_drug_reports: int, last_updated: str | None, today: dt.date) -> None:
+         min_expected: float, last_updated: str | None, today: dt.date) -> None:
     t, s = res.table, res.stats
+    expected = expected_events(t)
+    res_verdict = verdict(res, min_expected)
     conn.execute(
         """
         INSERT INTO faers_signal
-            (drug_id, event_definition, event_terms, drug_query, a, b, c, d,
+            (drug_id, event_definition, event_terms, drug_query, a, b, c, d, expected_a,
              prr, prr_lower95, prr_upper95, ror, ror_lower95, ror_upper95,
-             chi2_yates, is_signal, criteria, queried_on)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             chi2_yates, is_signal, criteria, verdict, queried_on)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (drug_id, event_definition) DO UPDATE SET
             event_terms = EXCLUDED.event_terms, drug_query = EXCLUDED.drug_query,
             a = EXCLUDED.a, b = EXCLUDED.b, c = EXCLUDED.c, d = EXCLUDED.d,
+            expected_a = EXCLUDED.expected_a,
             prr = EXCLUDED.prr, prr_lower95 = EXCLUDED.prr_lower95, prr_upper95 = EXCLUDED.prr_upper95,
             ror = EXCLUDED.ror, ror_lower95 = EXCLUDED.ror_lower95, ror_upper95 = EXCLUDED.ror_upper95,
             chi2_yates = EXCLUDED.chi2_yates, is_signal = EXCLUDED.is_signal,
-            criteria = EXCLUDED.criteria, queried_on = EXCLUDED.queried_on
+            criteria = EXCLUDED.criteria, verdict = EXCLUDED.verdict, queried_on = EXCLUDED.queried_on
         """,
-        (res.drug_id, event_definition, terms, " OR ".join(res.query_names), t.a, t.b, t.c, t.d,
+        (res.drug_id, event_definition, terms, res.drug_query, t.a, t.b, t.c, t.d, expected,
          s.prr, s.prr_lower95, s.prr_upper95, s.ror, s.ror_lower95, s.ror_upper95,
-         s.chi2_yates, res.signal, CRITERIA[criterion], today),
+         s.chi2_yates, res.signal, CRITERIA[criterion], res_verdict, today),
     )
     if event_definition not in EVENT_SCOPE:
         return  # unknown organ/endpoint: keep the statistics only
@@ -204,8 +241,9 @@ def save(conn, res: DrugResult, *, event_definition: str, terms: list[str], crit
         "evidence_type": "spontaneous adverse event reports",
         "source": source,
         "finding": (f"{'Signal' if res.signal else 'No signal'} ({CRITERIA[criterion]}); "
-                    f"{t.a} of {t.a + t.b} reports mention {event_definition} terms; {ror_text}"),
-        "verdict": verdict(res, min_drug_reports),
+                    f"{t.a} of {t.a + t.b} reports mention {event_definition} terms "
+                    f"({expected:.1f} expected); {ror_text}"),
+        "verdict": res_verdict,
         "citation": f"openFDA drug adverse event API, data updated {last_updated or 'unknown'}",
         "use_for_scoring": False,
         "method": "statistical_signal",
@@ -220,13 +258,19 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--drug", action="append", dest="drugs", help="drug name (repeatable); default all")
     p.add_argument("--source", help="only drugs with a reference_outcome row from this source, e.g. DILIrank")
     p.add_argument("--terms", type=pathlib.Path, default=DEFAULT_TERMS,
-                   help="file of MedDRA preferred terms, one per line (default: DILI narrow)")
+                   help="file of MedDRA preferred terms, one per line (default: dili_narrow.txt). "
+                        "Only dili_narrow.txt and dili_extended.txt also write a reference_outcome "
+                        "row; other files are stored in faers_signal only")
     p.add_argument("--drug-field", action="append", dest="drug_fields", choices=sorted(DRUG_FIELDS),
                    help="drug name field to search (repeatable; default: all three)")
+    # argparse treats % in help text as a format character, hence the escaping.
     p.add_argument("--criterion", choices=sorted(CRITERIA), default="ror",
-                   help="signal rule: " + "; ".join(f"{k} = {v}" for k, v in CRITERIA.items()))
-    p.add_argument("--min-drug-reports", type=int, default=100,
-                   help="below this many reports for the drug, 'no signal' is recorded as ambiguous")
+                   help="signal rule: " + "; ".join(f"{k} = {v}" for k, v in CRITERIA.items())
+                   .replace("%", "%%"))
+    p.add_argument("--min-expected", type=float, default=5,
+                   help="a drug without a signal is recorded as negative only if at least this "
+                        "many event reports were expected at the background rate and no more "
+                        "than that were seen; otherwise ambiguous (default: 5)")
     p.add_argument("--api-key", default=os.environ.get("OPENFDA_API_KEY"))
     p.add_argument("--cache", type=pathlib.Path, default=pathlib.Path(".faers_cache.json"),
                    help="file that stores counts so an interrupted run can resume")
@@ -234,6 +278,11 @@ def main(argv: list[str] | None = None) -> None:
 
     terms = read_terms(args.terms)
     event_definition = args.terms.stem
+    if event_definition not in EVENT_SCOPE:
+        print(f"note: term file '{args.terms.name}' is not one of "
+              f"{', '.join(n + '.txt' for n in EVENT_SCOPE)}; results go to faers_signal only "
+              f"(as event_definition '{event_definition}'), with no reference_outcome row.",
+              file=sys.stderr)
     drug_fields = args.drug_fields or list(DRUG_FIELDS)
     client = OpenFDA(api_key=args.api_key, cache_path=args.cache)
     today = dt.date.today()
@@ -265,10 +314,12 @@ def main(argv: list[str] | None = None) -> None:
                               drug_fields=drug_fields, event_search=event_search,
                               n_total=n_total, n_event=n_event, criterion=args.criterion)
                 if res.table is None:
+                    clear(conn, drug_id, event_definition)
+                    conn.commit()
                     print(f"[{i}/{len(drugs)}] {name}: {res.note}")
                     continue
                 save(conn, res, event_definition=event_definition, terms=terms,
-                     criterion=args.criterion, min_drug_reports=args.min_drug_reports,
+                     criterion=args.criterion, min_expected=args.min_expected,
                      last_updated=client.last_updated, today=today)
                 conn.commit()  # keep finished drugs if a later one fails
                 signals += bool(res.signal)

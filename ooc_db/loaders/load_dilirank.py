@@ -18,13 +18,17 @@ The DILIrank 2.0 workbook has two sheets, 'version 2' (current, 1,336
 drugs) and 'version 1' (the original 1,036); 'version 2' is used unless you
 pass --sheet.
 
-Re-running it updates existing DILIrank rows instead of duplicating them.
+Each load replaces the previous DILIrank list: rows are updated rather than
+duplicated, and DILIrank rows for drugs not in the loaded file (e.g. after
+switching between --sheet "version 1" and "version 2") are removed.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
+import io
 import pathlib
 import re
 import sys
@@ -91,10 +95,33 @@ def resolve_sheet(path: pathlib.Path, sheet: str | None = None) -> str | None:
         return sheet
 
 
+def _read_text_table(path: pathlib.Path) -> pd.DataFrame:
+    """CSV/TXT/TSV as saved by Excel: UTF-8 or Windows encoding, comma,
+    semicolon or tab separated, title rows narrower than the table."""
+    data = path.read_bytes()
+    for encoding in ("utf-8-sig", "cp1252"):
+        try:
+            text = data.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        text = data.decode("latin-1")
+    # The delimiter is whichever splits some early line (the header) into the
+    # most columns; title rows above the header may contain none at all.
+    sample = text.splitlines()[:30]
+    preferred = "\t" if path.suffix.lower() in (".tsv", ".txt") else ","
+    delimiter = max((preferred, ",", ";", "\t"),
+                    key=lambda d: max((len(next(csv.reader([line], delimiter=d), []))
+                                       for line in sample), default=0))
+    rows = list(csv.reader(io.StringIO(text), delimiter=delimiter))
+    width = max((len(r) for r in rows), default=0)
+    return pd.DataFrame([r + [""] * (width - len(r)) for r in rows], dtype=str)
+
+
 def _read_table(path: pathlib.Path, sheet: str | None) -> pd.DataFrame:
     if _is_text(path):
-        sep = "\t" if path.suffix.lower() == ".tsv" else ","
-        return pd.read_csv(path, header=None, dtype=str, sep=sep, keep_default_na=False)
+        return _read_text_table(path)
     return pd.read_excel(path, sheet_name=resolve_sheet(path, sheet), header=None, dtype=str,
                          keep_default_na=False)
 
@@ -162,25 +189,31 @@ def parse(path: pathlib.Path, sheet: str | None = None) -> list[Entry]:
     return entries
 
 
-def merge_duplicates(entries: list[Entry]) -> tuple[list[Entry], list[str]]:
-    """One entry per drug name. Conflicting duplicates become ambiguous."""
+def merge_duplicates(entries: list[Entry], less_concern_as: str = "positive"
+                     ) -> tuple[list[Entry], list[str]]:
+    """One entry per drug name.
+
+    Duplicates with the same verdict keep the most serious category;
+    duplicates with different verdicts become ambiguous.
+    """
     by_name: dict[str, list[Entry]] = {}
     for e in entries:
         by_name.setdefault(e.name.lower(), []).append(e)
 
     merged, warnings = [], []
     for group in by_name.values():
-        first = group[0]
-        cats = {e.category for e in group}
-        if len(cats) > 1:
+        verdicts = {verdict_for(e.category, less_concern_as) for e in group}
+        if len(verdicts) > 1:
+            first = group[0]
             warnings.append(
                 f"{first.name}: listed {len(group)} times with different categories "
                 f"({', '.join(sorted(e.raw_category for e in group))}); loaded as ambiguous"
             )
-            first = Entry(first.name, "ambiguous",
-                          " / ".join(e.raw_category for e in group), first.ltkbid,
-                          first.severity, first.label_section, first.comment)
-        merged.append(first)
+            merged.append(Entry(first.name, "ambiguous",
+                                " / ".join(e.raw_category for e in group), first.ltkbid,
+                                first.severity, first.label_section, first.comment))
+        else:
+            merged.append(min(group, key=lambda e: CATEGORIES.index(e.category)))
     return merged, warnings
 
 
@@ -193,10 +226,25 @@ def verdict_for(category: str, less_concern_as: str) -> str:
     }[category]
 
 
+def _finding(e: Entry) -> str:
+    details = [e.raw_category]
+    if e.severity:
+        details.append(f"severity class {e.severity}")
+    if e.label_section:
+        details.append(f"label section: {e.label_section}")
+    if e.comment:
+        details.append(f"DILIrank 2.0: {e.comment}")
+    return "; ".join(details)
+
+
 def load(conn, entries: list[Entry], *, less_concern_as: str = "positive",
          only_existing: bool = False, retrieved_on: dt.date | None = None) -> Counter:
+    """Write one DILIrank reference row per drug and remove DILIrank rows for
+    drugs not in `entries`, so the database matches the file just loaded."""
     retrieved_on = retrieved_on or dt.date.today()
     stats: Counter = Counter()
+    loaded: dict[int, tuple[Entry, str]] = {}   # drug_id -> (entry, verdict)
+
     for e in entries:
         if only_existing:
             drug_id = db.find_drug(conn, e.name)
@@ -207,13 +255,22 @@ def load(conn, entries: list[Entry], *, less_concern_as: str = "positive",
             drug_id, created = db.get_or_create_drug(conn, e.name)
             stats["drugs created"] += created
 
-        details = [e.raw_category]
-        if e.severity:
-            details.append(f"severity class {e.severity}")
-        if e.label_section:
-            details.append(f"label section: {e.label_section}")
-        if e.comment:
-            details.append(f"DILIrank 2.0: {e.comment}")
+        verdict = verdict_for(e.category, less_concern_as)
+        finding = _finding(e)
+        if drug_id in loaded:
+            # Two DILIrank names for one drug (e.g. via drug_alias).
+            other, other_verdict = loaded[drug_id]
+            if other_verdict == verdict:
+                stats["merged: same drug under two names"] += 1
+                continue
+            print(f"warning: DILIrank lists '{other.name}' ({other.raw_category}) and "
+                  f"'{e.name}' ({e.raw_category}), which are the same drug in the database; "
+                  "loaded as ambiguous", file=sys.stderr)
+            verdict = "ambiguous"
+            finding = f"{other.raw_category} / {e.raw_category}; conflicting DILIrank entries " \
+                      f"'{other.name}' and '{e.name}'"
+            stats["merged: conflicting names for one drug"] += 1
+        loaded[drug_id] = (e, verdict)
 
         db.upsert_reference(conn, {
             "drug_id": drug_id,
@@ -222,8 +279,8 @@ def load(conn, entries: list[Entry], *, less_concern_as: str = "positive",
             "species": "human",
             "evidence_type": "FDA drug labeling and literature",
             "source": SOURCE,
-            "finding": "; ".join(details),
-            "verdict": verdict_for(e.category, less_concern_as),
+            "finding": finding,
+            "verdict": verdict,
             "citation": CITATION,
             "use_for_scoring": True,
             "method": "database",
@@ -231,18 +288,41 @@ def load(conn, entries: list[Entry], *, less_concern_as: str = "positive",
             "retrieved_on": retrieved_on,
         })
         stats[f"loaded: {e.category} concern"] += 1
+
+    removed = conn.execute(
+        """DELETE FROM reference_outcome
+           WHERE source = %s AND method = 'database' AND endpoint = 'toxicity'
+             AND organ = 'liver' AND species = 'human' AND NOT (drug_id = ANY(%s))""",
+        (SOURCE, list(loaded)),
+    ).rowcount
+    if removed:
+        stats["removed: earlier DILIrank rows for drugs not in this file"] = removed
+
+    hand_typed = conn.execute(
+        "SELECT count(*) FROM reference_outcome WHERE source = %s AND method = 'curated'",
+        (SOURCE,),
+    ).fetchone()[0]
+    if hand_typed:
+        print(f"warning: {hand_typed} hand-entered reference rows have source 'DILIrank' "
+              "(method 'curated'). They are kept alongside the imported rows and may "
+              "duplicate or contradict them; change their method to 'database' or delete them.",
+              file=sys.stderr)
     return stats
 
 
 def download(dest: pathlib.Path = pathlib.Path("DILIrank_2.0.xlsx")) -> pathlib.Path:
     import requests
 
-    r = requests.get(DOWNLOAD_URL, params={"attachment": ""}, timeout=120,
-                     headers={"User-Agent": "ooc-db-loader"})
-    r.raise_for_status()
+    advice = ("Download it in a browser from the FDA page 'Drug-Induced Liver Injury Rank "
+              "(DILIrank 2.0) Dataset' and use --file instead.")
+    try:
+        r = requests.get(DOWNLOAD_URL, params={"attachment": ""}, timeout=120,
+                         headers={"User-Agent": "ooc-db-loader"})
+        r.raise_for_status()
+    except requests.RequestException as e:
+        sys.exit(f"Could not download DILIrank from {DOWNLOAD_URL}: {e}\n{advice}")
     if not r.content.startswith(b"PK"):  # .xlsx files are zip archives
-        sys.exit(f"The FDA returned something other than a spreadsheet from {DOWNLOAD_URL}. "
-                 "Download it in a browser and use --file instead.")
+        sys.exit(f"The FDA returned something other than a spreadsheet from {DOWNLOAD_URL}. {advice}")
     dest.write_bytes(r.content)
     print(f"Downloaded {len(r.content):,} bytes to {dest}")
     return dest
@@ -265,7 +345,7 @@ def main(argv: list[str] | None = None) -> None:
 
     path = download() if args.download else args.file
     sheet = resolve_sheet(path, args.sheet)
-    entries, warnings = merge_duplicates(parse(path, sheet))
+    entries, warnings = merge_duplicates(parse(path, sheet), args.less_concern_as)
     for w in warnings:
         print("warning:", w, file=sys.stderr)
     counts = Counter(e.category for e in entries)

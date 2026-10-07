@@ -15,9 +15,12 @@ animal outcomes for the same drugs, and scores how often the chip agrees.
 Command-line equivalent:
 
 ```
-psql -d ooc -f schema.sql
-psql -d ooc -f example_data.sql
+psql -U postgres -d ooc -f schema.sql
+psql -U postgres -d ooc -f example_data.sql
 ```
+
+On Windows, `psql` is in `C:\Program Files\PostgreSQL\<version>\bin\`
+unless you added that folder to your PATH.
 
 All tables live in the `ooc` schema. Write `ooc.drug`, or run
 `SET search_path TO ooc;` once per session.
@@ -39,10 +42,18 @@ All tables live in the `ooc` schema. Write `ooc.drug`, or run
 Notes:
 
 - **Controls** are experiments with `is_control = true` and no drug.
-  Treated chips are compared with controls that share their `batch_label`.
+  Treated chips are compared with the average of the control chips that
+  share their `batch_label` (each control chip counts once, however many
+  replicates it has). Give controls with a different vehicle their own
+  batch label.
 - **Verdicts** are `positive` (the effect happened: toxic, or effective),
   `negative`, or `ambiguous`. `endpoint` says whether you are asking about
   `toxicity` or `efficacy`.
+- **Organ and species** are written in lower case (`liver`, `human`,
+  `rat`); the database rejects `Liver` so that spellings cannot split the
+  results.
+- **Names** are unique regardless of capitals (`Aspirin` = `ASPIRIN`). A
+  drug name cannot also be another drug's alias.
 - **New organs or assays** need new `chip_model` and `readout` rows, not
   new columns.
 
@@ -51,10 +62,10 @@ Notes:
 | View | Shows |
 | --- | --- |
 | `v_measurement_vs_control` | each treated value, its batch control mean, fold change, and dose as a multiple of Cmax |
-| `v_reference_consensus` | one known answer per drug and species. If sources disagree it says `conflicting`, and that drug is excluded from scoring until you resolve it. |
-| `v_concordance` | chip verdict next to the known verdict, labelled true/false positive/negative |
-| `v_performance` | sensitivity, specificity and accuracy per chip model, endpoint and species |
-| `v_faers_vs_dilirank` | FAERS signal next to the DILIrank verdict, per drug |
+| `v_reference_consensus` | one known answer per drug and species. `ambiguous` sources are ignored when another gives a clear answer; if clear answers disagree it says `conflicting`. |
+| `v_concordance` | chip verdict next to the known verdict: true/false positive/negative, `not scored` (reference ambiguous or conflicting, or chip ambiguous) or `no reference` |
+| `v_performance` | sensitivity, specificity and accuracy per chip model, endpoint and species, plus how many drugs were not scored |
+| `v_faers_vs_dilirank` | FAERS verdict next to the DILIrank verdict, per drug |
 
 ```sql
 SELECT * FROM ooc.v_performance;
@@ -70,14 +81,31 @@ to ask whether the chip predicts humans better than animals do.
 ## Loading reference data automatically
 
 The `loaders/` folder has Python scripts that fill `reference_outcome` from
-public sources. Install Python 3.10+, then from the `ooc_db` folder:
+public sources. Install Python 3.10+, open a terminal in the `ooc_db`
+folder, and install the packages:
 
 ```
-pip install -r requirements.txt
-export OOC_DATABASE_URL=postgresql://postgres:YOUR_PASSWORD@localhost:5432/ooc
+python -m pip install -r requirements.txt
 ```
 
-(On Windows PowerShell: `$env:OOC_DATABASE_URL = "postgresql://..."`.)
+(On Windows, use `py` if `python` is not found.) Then tell the scripts
+where your database is.
+
+PowerShell (Windows):
+
+```
+$env:OOC_DATABASE_URL = 'postgresql://postgres:YOUR_PASSWORD@localhost:5432/ooc'
+```
+
+macOS / Linux:
+
+```
+export OOC_DATABASE_URL='postgresql://postgres:YOUR_PASSWORD@localhost:5432/ooc'
+```
+
+If the password contains `@ : / # ? %` or spaces, use this form instead:
+`host=localhost port=5432 dbname=ooc user=postgres password=YOUR_PASSWORD`.
+You can also pass either form with `--dsn` on each command.
 
 ### DILIrank: curated human liver-injury classification
 
@@ -90,10 +118,10 @@ python -m loaders.load_dilirank --download
 ```
 
 Or download it in a browser from the FDA page "Drug-Induced Liver Injury
-Rank (DILIrank 2.0) Dataset" and pass `--file "path/to/file.xlsx"`. The
+Rank (DILIrank 2.0) Dataset" and pass `--file "path\to\file.xlsx"`. The
 2.0 workbook has a `version 2` sheet (1,336 drugs, used by default) and a
 `version 1` sheet (the original 1,036; `--sheet "version 1"`). Older
-DILIrank 1.0 files and CSV exports also work.
+DILIrank 1.0 files and CSV/TXT exports (any Excel encoding) also work.
 
 Every DILIrank drug is added to `drug` (use `--only-existing` to load only
 drugs you already have). Most-DILI-concern drugs become `positive`,
@@ -102,20 +130,40 @@ No-DILI-concern `negative` and Ambiguous `ambiguous`. Less-DILI-concern is
 often leave Less-DILI-concern out instead, which `--less-concern-as
 ambiguous` does.
 
+Each load replaces the previous DILIrank list. Rows are updated, not
+duplicated, and DILIrank rows for drugs missing from the file you load
+(for example after switching from `version 2` to `version 1`) are
+removed. If two DILIrank names turn out to be the same drug in your
+database, through `drug_alias`, they are merged, and marked ambiguous if
+their categories disagree. If you type DILIrank rows by hand, set their
+`method` to `database` so the loader updates them instead of adding a
+second row.
+
 ### FAERS: signals from adverse event reports
 
 ```
-export OPENFDA_API_KEY=...          # free from open.fda.gov; needed for >500 drugs a day
 python -m loaders.faers_signals --drug acetaminophen --drug troglitazone
 python -m loaders.faers_signals --source DILIrank      # every DILIrank drug
 ```
 
+Each drug needs 2 requests to openFDA, and openFDA allows 1,000 a day
+without an API key. For more than about 500 drugs a day, get a free key
+from open.fda.gov and add `--api-key YOUR_KEY`, or set `OPENFDA_API_KEY`
+the same way as `OOC_DATABASE_URL` above.
+
 For each drug the script asks openFDA how many reports mention the drug, a
 set of liver-injury terms, both, and neither, and computes the PRR and ROR.
-With the default rule (`--criterion ror`), a drug has a signal when the
+With the default rule (`--criterion ror`), a drug has a **signal** when the
 lower 95% confidence bound of the ROR is above 1 and at least 3 reports
 mention both. `--criterion evans` uses PRR >= 2, chi-squared >= 4 and at
 least 3 reports instead.
+
+**Verdicts.** A signal is recorded as `positive`. No signal is recorded as
+`negative` only if the data could have shown one: at least 5 liver-injury
+reports were expected for the drug at the background rate
+(`--min-expected`), and no more than that were seen. Otherwise the
+verdict is `ambiguous`, because a drug with few reports, or with a
+non-significant excess, is not evidence of safety.
 
 **How drugs are found.** The drug's name, its `drug_alias` names, and
 their base names without salt words ("Abacavir sulfate" is also searched as
@@ -125,6 +173,13 @@ No single field is complete. In particular, openFDA has no harmonised name
 for many withdrawn drugs, which are common in DILIrank. Add brand names
 and other spellings to `drug_alias` if a drug is missed.
 
+Names are matched as words inside longer names, so "estradiol" also counts
+reports of ethinyl estradiol contraceptives, and "acetaminophen" counts
+combination products. The exact search used is saved in
+`faers_signal.drug_query`. Check it for drugs whose name is part of
+another drug's name, and narrow the search with `--drug-field
+generic_name` if needed.
+
 **Which events count.** `loaders/event_terms/dili_narrow.txt` lists the
 MedDRA preferred terms for liver injury itself (e.g. Drug-induced liver
 injury, Hepatotoxicity, Hepatic failure, Hepatitis toxic). Lab results
@@ -133,22 +188,33 @@ injury, Hepatotoxicity, Hepatic failure, Hepatitis toxic). Lab results
 encephalopathy, liver transplant, ...). Re-run with
 `--terms loaders/event_terms/dili_extended.txt` to see whether your
 conclusions depend on the term choice. The extended results are stored
-separately (source `FAERS (extended terms)`). The script warns about any
-term that matches no reports.
+separately, as source `FAERS (extended terms)`. Term files with other
+names are stored in `faers_signal` only. The script warns about any term
+that matches no reports.
 
-Results go to `faers_signal`. A summary row also goes to `reference_outcome`
-with `use_for_scoring = false`, because reporting signals are weaker
-evidence than DILIrank. Check how far they agree:
+Results go to `faers_signal`. For the two supplied term files a summary row
+also goes to `reference_outcome`, with `use_for_scoring = false`, because
+reporting signals are weaker evidence than DILIrank. Check how far they
+agree:
 
 ```sql
 SELECT event_definition, agreement, count(*)
 FROM ooc.v_faers_vs_dilirank GROUP BY 1, 2 ORDER BY 1, 2;
 ```
 
-Expect partial agreement. In the closest published benchmark (Courtois et
-al., *Front Pharmacol* 2018;9:1010, French pharmacovigilance database,
-not FAERS), a disproportionality method found 75% of Most-DILI-concern
-drugs and correctly cleared 79% of No-DILI-concern drugs.
+Expect partial agreement. The closest published benchmark is Courtois et
+al., *Front Pharmacol* 2018;9:1010, which used the French
+pharmacovigilance database, not FAERS. It reported that a
+disproportionality method flagged about 75% of Most-DILI-concern drugs and
+correctly cleared about 79% of No-DILI-concern drugs. It left
+Less-DILI-concern drugs out, so compare like with like:
+
+```sql
+SELECT event_definition, dilirank_class, faers_verdict, count(*)
+FROM ooc.v_faers_vs_dilirank
+WHERE dilirank_class IN ('most', 'no')
+GROUP BY 1, 2, 3 ORDER BY 1, 2, 3;
+```
 
 Treat FAERS signals as supporting evidence only:
 
@@ -160,20 +226,26 @@ Treat FAERS signals as supporting evidence only:
 - The patient's illness can cause the event (e.g. TB drugs and hepatitis).
 - Reports are not deduplicated.
 
-Counts are cached in `.faers_cache.json`, so an interrupted run resumes
-where it stopped. The cache is discarded automatically when openFDA
-publishes new data, and a release change during a run stops it, so every
-count in one run comes from the same data.
+Counts are cached in `.faers_cache.json` in the folder you run from, so an
+interrupted run resumes where it stopped. The cache is discarded
+automatically when openFDA publishes new data, and a release change during
+a run stops it, so every count in one run comes from the same data.
+Deleting the cache is always safe; it only means counts are fetched again.
 
 ### Tests
 
 ```
-pytest tests                                         # no database needed
-OOC_TEST_DSN=postgresql://postgres:pw@localhost/scratch pytest tests
+python -m pytest tests                  # no database needed
 ```
 
-The second form also runs the database tests. It drops and recreates the
-`ooc` schema, so point it at a scratch database, never your real one.
+To also run the database tests, point `OOC_TEST_DSN` at a **scratch**
+database. The tests drop and recreate the `ooc` schema in it, so never
+use your real database.
+
+```
+$env:OOC_TEST_DSN = 'postgresql://postgres:pw@localhost/scratch'; python -m pytest tests; Remove-Item Env:OOC_TEST_DSN
+OOC_TEST_DSN='postgresql://postgres:pw@localhost/scratch' python -m pytest tests     # macOS / Linux
+```
 
 ## Typical workflow
 
